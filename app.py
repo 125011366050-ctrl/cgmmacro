@@ -93,15 +93,19 @@ if st.button("Predict"):
     X = np.repeat(row_scaled[:, None, :], WINDOW, axis=1)
     
     with torch.no_grad():
-        embedding = lstm.get_embedding(torch.tensor(X, dtype=torch.float32)).numpy()
+        embedding = lstm.get_embedding(
+            torch.tensor(X, dtype=torch.float32)
+        ).numpy()
     
-    # DEBUG: Check embedding and TabNet dimensions
     st.write("Embedding shape:", embedding.shape)
+    st.write("Embedding dtype:", embedding.dtype)
     
     try:
         st.write("TabNet input_dim:", tabnet.input_dim)
     except Exception as e:
         st.write("Cannot read input_dim:", e)
+    
+    st.stop()   # STOP HERE
     
     pred = tabnet.predict(embedding.astype(np.float32))
     pred = glucose_scaler.inverse_transform(pred.reshape(-1, 1)).reshape(pred.shape)
