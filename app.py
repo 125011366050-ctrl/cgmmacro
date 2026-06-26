@@ -6,7 +6,7 @@ import joblib
 from datetime import datetime
 from pytorch_tabnet.tab_model import TabNetRegressor
 
-st.set_page_config(page_title="CGM AI Prediction", page_icon="🩸")
+st.set_page_config(page_title="recommendation system", page_icon="🩸")
 st.title("🩸 CGM AI Prediction System")
 st.write("Predict blood glucose for the next 30, 60 and 120 minutes.")
 
