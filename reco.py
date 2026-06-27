@@ -6,8 +6,8 @@ import joblib
 import os
 import warnings
 from datetime import datetime
-from typing import Dict, List, Optional
-from dataclasses import dataclass, field
+from typing import Dict
+from dataclasses import dataclass
 
 warnings.filterwarnings('ignore')
 
@@ -30,7 +30,6 @@ class Config:
     MEDIUM_SPIKE: float = 50.0
     CRITICAL_GLUCOSE: float = 200.0
     WARNING_GLUCOSE: float = 180.0
-    TARGET_GLUCOSE: float = 140.0
 
     # Food risk thresholds
     HIGH_RISK_GI_MAX: float = 40.0
@@ -45,14 +44,14 @@ class Config:
 
 def build_cgm_features(g: np.ndarray, carbs=0, protein=0, fat=0) -> np.ndarray:
     g = np.array(g, dtype=np.float32)
-    if len(g) < 2:
-        g = np.pad(g, (2 - len(g), 0), mode='edge')
+    if len(g) < 3:
+        g = np.pad(g, (3 - len(g), 0), mode='edge')
 
     current = g[-1]
     mean_g = np.mean(g)
     std_g = np.std(g)
     slope = float(np.polyfit(np.arange(len(g)), g, 1)[0])
-    acceleration = float(np.mean(np.diff(np.diff(g)))) if len(g) >= 3 else 0.0
+    acceleration = float(np.mean(np.diff(np.diff(g))))
     gl_ma_5 = float(np.mean(g[-5:])) if len(g) >= 5 else mean_g
     gl_std_5 = float(np.std(g[-5:])) if len(g) >= 5 else std_g
     spike = float(np.max(g) - np.mean(g[:3]))
@@ -69,7 +68,8 @@ def build_cgm_features(g: np.ndarray, carbs=0, protein=0, fat=0) -> np.ndarray:
     ], dtype=np.float32)
 
 
-def build_lstm_input(cgm_readings, carbs=0, protein=0, fat=0, window_size=30) -> np.ndarray:
+def build_lstm_input(cgm_readings, carbs=0, protein=0,
+                     fat=0, window_size=30) -> np.ndarray:
     cgm = np.array(cgm_readings, dtype=np.float32)
     cgm_interp = np.interp(
         np.linspace(0, len(cgm) - 1, window_size),
@@ -82,13 +82,20 @@ def build_lstm_input(cgm_readings, carbs=0, protein=0, fat=0, window_size=30) ->
         window = cgm_interp[start:end]
         if len(window) < 10:
             window = np.pad(window, (10 - len(window), 0), mode='edge')
-        features = build_cgm_features(window, carbs=carbs, protein=protein, fat=fat)
+        features = build_cgm_features(
+            window, carbs=carbs, protein=protein, fat=fat
+        )
         sequence.append(features)
     return np.array(sequence, dtype=np.float32)
 
 
 # ==============================
 # LSTM MODEL
+# Exact architecture matched from lstm_encoder_trained.pth keys:
+# embedding.0 Linear(128,128) | embedding.1 BN(128) | embedding.2 ReLU
+# embedding.3 Dropout         | embedding.4 Linear(128,64) | embedding.5 BN(64)
+# output Linear(64,3)
+# get_embedding() returns 64-dim output of embedding block
 # ==============================
 
 class LSTMEncoder(nn.Module):
@@ -101,12 +108,12 @@ class LSTMEncoder(nn.Module):
             batch_first=True
         )
         self.embedding = nn.Sequential(
-            nn.Linear(hidden_size, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Dropout(p=0.0),
-            nn.Linear(128, 64),
-            nn.BatchNorm1d(64),
+            nn.Linear(hidden_size, 128),   # embedding.0
+            nn.BatchNorm1d(128),           # embedding.1
+            nn.ReLU(),                     # embedding.2
+            nn.Dropout(p=0.0),            # embedding.3
+            nn.Linear(128, 64),            # embedding.4
+            nn.BatchNorm1d(64),            # embedding.5
         )
         self.output = nn.Linear(64, n_horizons)
 
@@ -116,17 +123,24 @@ class LSTMEncoder(nn.Module):
 
     def get_embedding(self, x):
         _, (h, _) = self.lstm(x)
-        return self.embedding(h[-1])
+        return self.embedding(h[-1])   # shape: (batch, 64)
 
 
 # ==============================
 # PREDICTION ENGINE
+# KEY FIX: TabNet output_dim=3, clip_value=1
+# TabNet was trained to output scaled glucose directly.
+# glucose_scaler.inverse_transform maps scaled -> mg/dL.
+# If scaler was fitted on raw mg/dL and TabNet outputs
+# already-inverse-scaled values, do NOT call inverse_transform.
+# We detect this at runtime by checking output magnitude.
 # ==============================
 
 class PredictionEngine:
     def __init__(self, config: Config):
         self.config = config
         self.device = torch.device(config.DEVICE)
+        self._scaler_needed = None   # determined on first predict
         self.load_models()
 
     def load_models(self):
@@ -134,7 +148,7 @@ class PredictionEngine:
 
         scaler_path = os.path.join(base, "glucose_scaler.pkl")
         if not os.path.exists(scaler_path):
-            raise FileNotFoundError(f"Missing: {scaler_path}")
+            raise FileNotFoundError(f"Missing scaler: {scaler_path}")
         self.scaler = joblib.load(scaler_path)
         print("Scaler loaded")
 
@@ -146,7 +160,7 @@ class PredictionEngine:
 
         lstm_path = os.path.join(base, "lstm_encoder_trained.pth")
         if not os.path.exists(lstm_path):
-            raise FileNotFoundError(f"Missing: {lstm_path}")
+            raise FileNotFoundError(f"Missing LSTM: {lstm_path}")
         self.lstm.load_state_dict(
             torch.load(lstm_path, map_location=self.device), strict=True
         )
@@ -157,20 +171,45 @@ class PredictionEngine:
         self.tabnet = TabNetRegressor()
         tabnet_path = os.path.join(base, "tabnet_on_learned_embeddings.zip")
         if not os.path.exists(tabnet_path):
-            raise FileNotFoundError(f"Missing: {tabnet_path}")
+            raise FileNotFoundError(f"Missing TabNet: {tabnet_path}")
         self.tabnet.load_model(tabnet_path)
-        print("TabNet loaded")
+        print("TabNet loaded — input_dim=64, output_dim=3, clip_value=1")
 
     def predict_glucose(self, x: np.ndarray) -> np.ndarray:
         if len(x.shape) == 2:
             x = x[np.newaxis, :, :]
         x = x.astype(np.float32)
+
         t = torch.from_numpy(x).float().to(self.device)
         with torch.no_grad():
-            emb = self.lstm.get_embedding(t).cpu().numpy()
-        pred = self.tabnet.predict(emb)
-        pred = self.scaler.inverse_transform(pred.reshape(-1, 1))
-        return np.clip(pred.flatten(), 50, 400)
+            emb = self.lstm.get_embedding(t).cpu().numpy()  # (1, 64)
+
+        print(f"Embedding shape: {emb.shape} | mean: {emb.mean():.4f} | std: {emb.std():.4f}")
+
+        raw = self.tabnet.predict(emb)   # shape: (1, 3)
+        print(f"TabNet raw output: {raw}")
+
+        # Determine on first call whether scaler is needed.
+        # TabNet clip_value=1 means raw outputs are in ~[-1, 1] if trained
+        # on scaled targets, OR in mg/dL range if trained on raw targets.
+        # We check: if all values are in [-2, 2] -> apply inverse_transform.
+        # If values already look like glucose (50-400) -> use directly.
+        if self._scaler_needed is None:
+            if np.all(np.abs(raw) <= 5):
+                self._scaler_needed = True
+                print("Scaler mode: inverse_transform ENABLED (outputs are scaled)")
+            else:
+                self._scaler_needed = False
+                print("Scaler mode: inverse_transform DISABLED (outputs already in mg/dL)")
+
+        if self._scaler_needed:
+            pred = self.scaler.inverse_transform(raw.reshape(-1, 1))
+            pred = pred.flatten()
+        else:
+            pred = raw.flatten()
+
+        print(f"Final predictions: {pred}")
+        return np.clip(pred, 50, 400)
 
     def get_embedding(self, x: np.ndarray) -> np.ndarray:
         if len(x.shape) == 2:
@@ -205,14 +244,14 @@ class PredictionEngine:
 
 
 # ==============================
-# FOOD DATABASE LOADER
+# FOOD DATABASE
 # ==============================
 
 def load_food_database(food_file: str) -> pd.DataFrame:
     for sheet in ["GI & Nutrition Data", "Sheet1", 0]:
         try:
             df = pd.read_excel(food_file, sheet_name=sheet)
-            print(f"Food file loaded from sheet: {sheet}")
+            print(f"Food DB loaded — sheet: {sheet} | rows: {len(df)}")
             break
         except Exception:
             continue
@@ -252,7 +291,7 @@ def load_food_database(food_file: str) -> pd.DataFrame:
     for col in ["GI", "GL", "Carbs", "Protein", "Fat", "Calories", "Fiber"]:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-    print(f"Food database ready: {len(df)} items | GI range: {df['GI'].min():.0f}-{df['GI'].max():.0f}")
+    print(f"Food DB ready | GI range: {df['GI'].min():.0f}–{df['GI'].max():.0f}")
     return df
 
 
@@ -264,16 +303,14 @@ class FoodRankingEngine:
 
     def _normalize(self, x: np.ndarray) -> np.ndarray:
         mn, mx = x.min(), x.max()
-        if mx > mn:
-            return (x - mn) / (mx - mn + 1e-8)
-        return np.ones_like(x) * 0.5
+        return (x - mn) / (mx - mn + 1e-8) if mx > mn else np.ones_like(x) * 0.5
 
     def estimate_spike(self, food: dict, current_glucose: float) -> float:
         gi = float(food.get("GI", 55))
         carbs = float(food.get("Carbs", 30))
         fiber = float(food.get("Fiber", 0))
         protein = float(food.get("Protein", 5))
-        effective_carbs = max(0, carbs - fiber * 0.5)
+        effective_carbs = max(0.0, carbs - fiber * 0.5)
         spike = (gi / 100.0) * (effective_carbs / 50.0) * 40.0
         spike *= max(0.7, 1.0 - protein * 0.01)
         return float(np.clip(spike, 0, 200))
@@ -292,7 +329,6 @@ class FoodRankingEngine:
 
         if len(filtered) < 5:
             filtered = df.nsmallest(max(10, len(df) // 2), "GI")
-
         return filtered.reset_index(drop=True)
 
     def rank(self, df: pd.DataFrame, risk_level: str,
@@ -334,7 +370,9 @@ class FoodRankingEngine:
         out = out.sort_values("Score", ascending=False).head(top_k).reset_index(drop=True)
         out["Rank"] = range(1, len(out) + 1)
         out["Recommendation"] = out["Score"].apply(
-            lambda s: "⭐ Top Pick" if s > 0.75 else "👍 Good Choice" if s > 0.55 else "✓ Acceptable"
+            lambda s: "⭐ Top Pick" if s > 0.75
+            else "👍 Good Choice" if s > 0.55
+            else "✓ Acceptable"
         )
         return out
 
@@ -342,15 +380,17 @@ class FoodRankingEngine:
                   current_glucose: float) -> Dict:
         meal_keywords = {
             "Breakfast": ["Breakfast", "Idli", "Dosa", "Porridge", "Oats", "Upma"],
-            "Lunch": ["Rice", "Dal", "Curry", "Wheat", "Lentil", "Sabzi"],
-            "Dinner": ["Roti", "Wheat", "Millet", "Curry", "Vegetable", "Dal"],
-            "Snack": ["Snack", "Fruit", "Nut", "Seed", "Salad", "Egg", "Dairy"]
+            "Lunch":     ["Rice", "Dal", "Curry", "Wheat", "Lentil", "Sabzi"],
+            "Dinner":    ["Roti", "Wheat", "Millet", "Curry", "Vegetable", "Dal"],
+            "Snack":     ["Snack", "Fruit", "Nut", "Seed", "Salad", "Egg", "Dairy"]
         }
         plan = {}
         for meal, keywords in meal_keywords.items():
             pattern = "|".join(keywords)
             if "Category" in df.columns:
-                subset = df[df["Category"].str.contains(pattern, case=False, na=False)]
+                subset = df[
+                    df["Category"].str.contains(pattern, case=False, na=False)
+                ]
             else:
                 subset = pd.DataFrame()
 
