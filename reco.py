@@ -17,7 +17,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 @dataclass
 class Config:
     DATA_PATH: str = BASE_DIR
-    FOOD_FILE: str = os.path.join(BASE_DIR, "Indian_Foods_GI_GL_Database(1).xlsx")
+    FOOD_FILE: str = os.path.join(BASE_DIR, "Indian_Foods_GI_GL_Database (1).xlsx")
     DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
     SEED: int = 42
     HIDDEN_SIZE: int = 128
