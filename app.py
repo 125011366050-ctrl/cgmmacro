@@ -1,5 +1,5 @@
 # ============================================================================
-# APP.PY - COMPLETE FIXED VERSION
+# APP.PY - FINAL VERSION (NO CHANGES NEEDED)
 # ============================================================================
 
 import streamlit as st
@@ -61,7 +61,7 @@ st.markdown("---")
 debug_mode = st.checkbox("🔧 Debug Mode", value=False)
 
 if st.button("🔍 Run Full Analysis", use_container_width=True):
-    with st.spinner("⚙️ Scaling → Removing NaNs → LSTM → Normalize Embedding → TabNet → Predict..."):
+    with st.spinner("⚙️ Scaling features → LSTM → TabNet → Generating recommendations..."):
         try:
             cgm_array = np.array(cgm_inputs, dtype=np.float32)
 
