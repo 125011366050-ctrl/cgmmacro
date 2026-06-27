@@ -10,15 +10,16 @@ import joblib
 import os
 from datetime import datetime
 import warnings
+
 warnings.filterwarnings("ignore")
 
 
 # =========================
-# CONFIG
+# CONFIG (FIXED)
 # =========================
 class Config:
-   self.config.DATA_PATH = "."
-    FOOD_FILE = "Indian_Foods_GI_GL_Database.xlsx"
+    DATA_PATH = "."
+    FOOD_FILE = "Indian_Foods_GI_GL_Database(1).xlsx"
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     SEED = 42
@@ -28,7 +29,7 @@ class Config:
 
 
 # =========================
-# PATH HELPER (FIXED)
+# PATH HELPER
 # =========================
 def get_path(base_dir, file_name):
     return os.path.join(base_dir, file_name)
@@ -80,7 +81,7 @@ class PredictionEngine:
         base = self.config.DATA_PATH
 
         # ======================
-        # SCALER FIXED
+        # SCALER
         # ======================
         scaler_path = get_path(base, "glucose_scaler.pkl")
 
@@ -91,7 +92,7 @@ class PredictionEngine:
         print("Scaler loaded")
 
         # ======================
-        # TRAIN SHAPE
+        # TRAIN DATA
         # ======================
         X_train_path = get_path(base, "X_train.npy")
 
@@ -114,6 +115,9 @@ class PredictionEngine:
 
         lstm_path = get_path(base, "lstm_encoder_trained.pth")
 
+        if not os.path.exists(lstm_path):
+            raise FileNotFoundError(f"Missing LSTM model: {lstm_path}")
+
         self.lstm.load_state_dict(torch.load(lstm_path, map_location=self.device))
         self.lstm.eval()
 
@@ -127,6 +131,9 @@ class PredictionEngine:
         self.tabnet = TabNetRegressor()
         tabnet_path = get_path(base, "tabnet_on_learned_embeddings.zip")
 
+        if not os.path.exists(tabnet_path):
+            raise FileNotFoundError(f"Missing TabNet: {tabnet_path}")
+
         self.tabnet.load_model(tabnet_path)
 
         print("TabNet loaded")
@@ -134,7 +141,7 @@ class PredictionEngine:
         self.embedding_dim = self.config.HIDDEN_SIZE
 
     # ======================
-    # PREDICTION
+    # PREDICT
     # ======================
     def predict_glucose(self, x):
         if len(x.shape) == 2:
@@ -146,8 +153,8 @@ class PredictionEngine:
             emb = self.lstm.get_embedding(x).cpu().numpy()
 
         pred = self.tabnet.predict(emb)
-
         pred = self.scaler.inverse_transform(pred.reshape(-1, 1))
+
         return np.clip(pred.flatten(), 50, 400)
 
 
@@ -179,7 +186,6 @@ class RiskEngine:
 # =========================
 class ClinicalOrchestrator:
     def __init__(self, config):
-        self.config = config
         self.engine = PredictionEngine(config)
         self.risk = RiskEngine()
 
@@ -194,14 +200,13 @@ class ClinicalOrchestrator:
 
 
 # =========================
-# MAIN TEST
+# MAIN
 # =========================
 def main():
     config = Config()
     system = ClinicalOrchestrator(config)
 
     X = np.load(os.path.join(config.DATA_PATH, "X_test.npy"))
-
     sample = X[0:1]
 
     result = system.run(120, sample)
