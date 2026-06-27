@@ -49,9 +49,7 @@ with col_b:
     for i in range(10):
         col = row1[i] if i < 5 else row2[i - 5]
         with col:
-            v = st.number_input(
-                f"t-{9 - i}", 50, 400, defaults[i], 1, key=f"cgm_{i}"
-            )
+            v = st.number_input(f"t-{9 - i}", 50, 400, defaults[i], 1, key=f"cgm_{i}")
             cgm_inputs.append(v)
 
 st.markdown("---")
@@ -59,46 +57,8 @@ st.markdown("---")
 if st.button("🔍 Run Full Analysis", use_container_width=True):
     with st.spinner("Running prediction, food ranking, and activity plan..."):
         try:
-            # ── DEBUG PANEL ──────────────────────────────────────
-            with st.expander("🔧 Debug Info (expand to inspect pipeline)", expanded=False):
-                g = np.array(cgm_inputs, dtype=np.float32)
-                st.write("**CGM input array:**", g)
-                st.write("**CGM shape:**", g.shape)
-                st.write(f"**CGM range:** {g.min():.1f} – {g.max():.1f} mg/dL")
-                st.write(f"**Meal — Carbs:** {meal_carbs}g | Protein: {meal_protein}g | Fat: {meal_fat}g")
-
-                from reco import build_lstm_input
-                seq = build_lstm_input(
-                    cgm_inputs, carbs=meal_carbs,
-                    protein=meal_protein, fat=meal_fat, window_size=30
-                )
-                st.write("**LSTM input sequence shape:**", seq.shape)
-                st.write(f"**Sequence mean:** {seq.mean():.4f} | std: {seq.std():.4f}")
-                st.write(f"**Sequence min:** {seq.min():.4f} | max: {seq.max():.4f}")
-
-                import torch
-                x = seq[np.newaxis, :, :]
-                x_t = torch.from_numpy(x.astype(np.float32)).to(
-                    next(system.prediction_engine.lstm.parameters()).device
-                )
-                with torch.no_grad():
-                    emb = system.prediction_engine.lstm.get_embedding(x_t).cpu().numpy()
-
-                st.write("**Embedding shape:**", emb.shape)
-                st.write(f"**Embedding mean:** {emb.mean():.4f} | std: {emb.std():.4f}")
-                st.write(f"**Embedding min:** {emb.min():.4f} | max: {emb.max():.4f}")
-
-                raw_pred = system.prediction_engine.tabnet.predict(emb)
-                st.write("**TabNet raw output (scaled):**", raw_pred)
-
-                unscaled = system.prediction_engine.scaler.inverse_transform(
-                    raw_pred.reshape(-1, 1)
-                )
-                st.write("**Scaler inverse output (mg/dL):**", unscaled)
-
-            # ── RUN FULL SYSTEM ──────────────────────────────────
             result = system.run(
-                cgm_readings=cgm_inputs,
+                cgm_readings=np.array(cgm_inputs, dtype=np.float32),
                 carbs=meal_carbs,
                 protein=meal_protein,
                 fat=meal_fat,
@@ -120,12 +80,9 @@ if st.button("🔍 Run Full Analysis", use_container_width=True):
             st.markdown("---")
             st.subheader("📊 Predicted Glucose Levels")
             c1, c2, c3 = st.columns(3)
-            c1.metric("30 min", f"{preds['30min']:.1f} mg/dL",
-                      delta=f"{preds['30min'] - current:+.1f}")
-            c2.metric("60 min", f"{preds['60min']:.1f} mg/dL",
-                      delta=f"{preds['60min'] - current:+.1f}")
-            c3.metric("90 min", f"{preds['90min']:.1f} mg/dL",
-                      delta=f"{preds['90min'] - current:+.1f}")
+            c1.metric("30 min", f"{preds['30min']:.1f} mg/dL", delta=f"{preds['30min'] - current:+.1f}")
+            c2.metric("60 min", f"{preds['60min']:.1f} mg/dL", delta=f"{preds['60min'] - current:+.1f}")
+            c3.metric("90 min", f"{preds['90min']:.1f} mg/dL", delta=f"{preds['90min'] - current:+.1f}")
 
             # ── RISK ─────────────────────────────────────────────
             st.markdown("---")
@@ -149,6 +106,7 @@ if st.button("🔍 Run Full Analysis", use_container_width=True):
             # ── CGM SIGNAL SUMMARY ───────────────────────────────
             st.markdown("---")
             st.subheader("🔬 CGM Signal Summary")
+            g = np.array(cgm_inputs, dtype=np.float32)
             cgm_slope = float(np.polyfit(np.arange(10), g, 1)[0])
             cgm_roc = float((g[-1] - g[-5]) / 5)
             cgm_cv = float(np.std(g) / (np.mean(g) + 1e-6) * 100)
@@ -178,35 +136,20 @@ if st.button("🔍 Run Full Analysis", use_container_width=True):
 
                 def highlight_spike(row):
                     val = row.get("Predicted_Spike", 0)
-                    if val < 20:
-                        color = "#d4edda"
-                    elif val < 40:
-                        color = "#fff3cd"
-                    else:
-                        color = "#f8d7da"
+                    color = "#d4edda" if val < 20 else "#fff3cd" if val < 40 else "#f8d7da"
                     return [f"background-color: {color}"] * len(row)
 
                 fmt = {}
-                if "GI" in food_recs.columns:
-                    fmt["GI"] = "{:.0f}"
-                if "GL" in food_recs.columns:
-                    fmt["GL"] = "{:.1f}"
-                if "Carbs" in food_recs.columns:
-                    fmt["Carbs"] = "{:.1f}g"
-                if "Protein" in food_recs.columns:
-                    fmt["Protein"] = "{:.1f}g"
-                if "Fiber" in food_recs.columns:
-                    fmt["Fiber"] = "{:.1f}g"
-                if "Predicted_Spike" in food_recs.columns:
-                    fmt["Predicted_Spike"] = "+{:.1f} mg/dL"
-                if "Predicted_Peak" in food_recs.columns:
-                    fmt["Predicted_Peak"] = "{:.0f} mg/dL"
-                if "Score" in food_recs.columns:
-                    fmt["Score"] = "{:.3f}"
+                if "GI" in food_recs.columns: fmt["GI"] = "{:.0f}"
+                if "GL" in food_recs.columns: fmt["GL"] = "{:.1f}"
+                if "Carbs" in food_recs.columns: fmt["Carbs"] = "{:.1f}g"
+                if "Protein" in food_recs.columns: fmt["Protein"] = "{:.1f}g"
+                if "Fiber" in food_recs.columns: fmt["Fiber"] = "{:.1f}g"
+                if "Predicted_Spike" in food_recs.columns: fmt["Predicted_Spike"] = "+{:.1f} mg/dL"
+                if "Predicted_Peak" in food_recs.columns: fmt["Predicted_Peak"] = "{:.0f} mg/dL"
+                if "Score" in food_recs.columns: fmt["Score"] = "{:.3f}"
 
-                styled = food_recs[show_cols].style.apply(
-                    highlight_spike, axis=1
-                ).format(fmt)
+                styled = food_recs[show_cols].style.apply(highlight_spike, axis=1).format(fmt)
                 st.dataframe(styled, use_container_width=True)
             else:
                 st.info("No food recommendations generated.")
@@ -224,18 +167,11 @@ if st.button("🔍 Run Full Analysis", use_container_width=True):
                         if items:
                             mdf = pd.DataFrame(items)
                             mfmt = {}
-                            if "GI" in mdf.columns:
-                                mfmt["GI"] = "{:.0f}"
-                            if "GL" in mdf.columns:
-                                mfmt["GL"] = "{:.1f}"
-                            if "Predicted_Spike" in mdf.columns:
-                                mfmt["Predicted_Spike"] = "+{:.1f} mg/dL"
-                            if "Score" in mdf.columns:
-                                mfmt["Score"] = "{:.3f}"
-                            st.dataframe(
-                                mdf.style.format(mfmt),
-                                use_container_width=True
-                            )
+                            if "GI" in mdf.columns: mfmt["GI"] = "{:.0f}"
+                            if "GL" in mdf.columns: mfmt["GL"] = "{:.1f}"
+                            if "Predicted_Spike" in mdf.columns: mfmt["Predicted_Spike"] = "+{:.1f} mg/dL"
+                            if "Score" in mdf.columns: mfmt["Score"] = "{:.3f}"
+                            st.dataframe(mdf.style.format(mfmt), use_container_width=True)
                         else:
                             st.info(f"No items found for {meal_name}.")
             else:
@@ -274,19 +210,13 @@ if st.button("🔍 Run Full Analysis", use_container_width=True):
             st.markdown("---")
             st.subheader("📋 Clinical Summary")
 
-            top_food = "N/A"
-            top_gi = "N/A"
-            top_spike = 0.0
+            top_food, top_gi, top_spike = "N/A", "N/A", 0.0
             if isinstance(food_recs, pd.DataFrame) and not food_recs.empty:
                 top_food = food_recs.iloc[0].get("Food_Name", "N/A")
                 top_gi = food_recs.iloc[0].get("GI", "N/A")
                 top_spike = food_recs.iloc[0].get("Predicted_Spike", 0.0)
 
-            urgency_label = (
-                "IMMEDIATE" if risk_level == "HIGH"
-                else "SOON" if risk_level == "MEDIUM"
-                else "ROUTINE"
-            )
+            urgency_label = "IMMEDIATE" if risk_level == "HIGH" else "SOON" if risk_level == "MEDIUM" else "ROUTINE"
 
             st.code(f"""
 CLINICAL SUMMARY — {result['timestamp']}
