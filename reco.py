@@ -21,7 +21,7 @@ class Config:
 
 
 class LSTMEncoder(nn.Module):
-    def __init__(self, input_size, hidden_size=128):
+    def __init__(self, input_size, hidden_size=128, n_horizons=3):
         super().__init__()
         self.lstm = nn.LSTM(
             input_size=input_size,
@@ -30,14 +30,19 @@ class LSTMEncoder(nn.Module):
             batch_first=True
         )
         self.embedding = nn.Sequential(
-            nn.Linear(hidden_size, 64),       # embedding.0  (has weight+bias)
-            nn.BatchNorm1d(64),               # embedding.1  (has weight only — gamma)
-            nn.Linear(64, 64, bias=False)     # embedding.2  (no bias)
+            nn.Linear(hidden_size, 128),    # embedding.0
+            nn.BatchNorm1d(128),            # embedding.1
+            nn.ReLU(),                      # embedding.2
+            nn.Dropout(p=0.0),             # embedding.3
+            nn.Linear(128, 64),             # embedding.4
+            nn.BatchNorm1d(64),             # embedding.5
         )
+        self.output = nn.Linear(64, n_horizons)
 
     def forward(self, x):
         _, (h, _) = self.lstm(x)
-        return self.embedding(h[-1])
+        emb = self.embedding(h[-1])
+        return self.output(emb)
 
     def get_embedding(self, x):
         _, (h, _) = self.lstm(x)
@@ -62,7 +67,8 @@ class PredictionEngine:
 
         self.lstm = LSTMEncoder(
             input_size=self.config.INPUT_SIZE,
-            hidden_size=self.config.HIDDEN_SIZE
+            hidden_size=self.config.HIDDEN_SIZE,
+            n_horizons=self.config.N_HORIZONS
         ).to(self.device)
 
         lstm_path = os.path.join(base, "lstm_encoder_trained.pth")
