@@ -4,7 +4,6 @@ import torch
 import torch.nn as nn
 import joblib
 import os
-from datetime import datetime
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -22,11 +21,7 @@ class Config:
     INPUT_SIZE = 18
 
 
-def get_path(base_dir, file_name):
-    return os.path.join(base_dir, file_name)
-
-
-class LSTMWithPredictionHead(nn.Module):
+class LSTMWithEmbeddingOutput(nn.Module):
     def __init__(self, input_size, hidden_size=128, n_horizons=3):
         super().__init__()
         self.lstm = nn.LSTM(
@@ -35,21 +30,22 @@ class LSTMWithPredictionHead(nn.Module):
             num_layers=2,
             batch_first=True
         )
-        self.head = nn.Sequential(
+        self.embedding = nn.Sequential(
             nn.Linear(hidden_size, 128),
             nn.ReLU(),
             nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, n_horizons)
+            nn.ReLU()
         )
+        self.output = nn.Linear(64, n_horizons)
 
     def forward(self, x):
         _, (h, _) = self.lstm(x)
-        return self.head(h[-1])
+        emb = self.embedding(h[-1])
+        return self.output(emb)
 
     def get_embedding(self, x):
         _, (h, _) = self.lstm(x)
-        return h[-1]
+        return self.embedding(h[-1])
 
 
 class PredictionEngine:
@@ -71,7 +67,7 @@ class PredictionEngine:
         input_size = self.config.INPUT_SIZE
         print("Input size:", input_size)
 
-        self.lstm = LSTMWithPredictionHead(
+        self.lstm = LSTMWithEmbeddingOutput(
             input_size=input_size,
             hidden_size=self.config.HIDDEN_SIZE,
             n_horizons=self.config.N_HORIZONS
