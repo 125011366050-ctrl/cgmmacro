@@ -1,7 +1,3 @@
-# ============================================================================
-# RECO.PY - FINAL FIXED VERSION (CRITICAL FIXES ONLY)
-# ============================================================================
-
 import numpy as np
 import pandas as pd
 import torch
@@ -18,7 +14,6 @@ warnings.filterwarnings('ignore')
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-
 @dataclass
 class Config:
     DATA_PATH: str = BASE_DIR
@@ -28,7 +23,7 @@ class Config:
     HIDDEN_SIZE: int = 128
     N_HORIZONS: int = 3
     INPUT_SIZE: int = 18
-    WINDOW_SIZE: int = 30
+    WINDOW_SIZE: int = 36
     LOW_SPIKE: float = 20.0
     MEDIUM_SPIKE: float = 50.0
     CRITICAL_GLUCOSE: float = 200.0
@@ -38,7 +33,6 @@ class Config:
     MEDIUM_RISK_GI_MAX: float = 55.0
     MEDIUM_RISK_GL_MAX: float = 20.0
 
-
 def build_cgm_features(g: np.ndarray, carbs=0, protein=0, fat=0) -> np.ndarray:
     g = np.array(g, dtype=np.float32)
     if len(g) < 3:
@@ -47,11 +41,11 @@ def build_cgm_features(g: np.ndarray, carbs=0, protein=0, fat=0) -> np.ndarray:
     mean_g = np.mean(g)
     std_g = np.std(g)
     slope = float(np.polyfit(np.arange(len(g)), g, 1)[0])
-    acceleration = float(np.mean(np.diff(np.diff(g))))
+    acceleration = float(np.mean(np.diff(np.diff(g)))) if len(g) >= 3 else 0.0
     gl_ma_5 = float(np.mean(g[-5:])) if len(g) >= 5 else mean_g
     gl_std_5 = float(np.std(g[-5:])) if len(g) >= 5 else std_g
-    spike = float(np.max(g) - np.mean(g[:3]))
-    gl_diff = float(g[-1] - g[-2])
+    spike = float(np.max(g) - np.mean(g[:3])) if len(g) >= 3 else 0.0
+    gl_diff = float(g[-1] - g[-2]) if len(g) >= 2 else 0.0
     cv = float(std_g / (mean_g + 1e-6))
     roc = float((g[-1] - g[-5]) / 5) if len(g) >= 6 else slope
     GL = current
@@ -61,12 +55,11 @@ def build_cgm_features(g: np.ndarray, carbs=0, protein=0, fat=0) -> np.ndarray:
     return np.array([
         GL, gl_ma_5, gl_std_5, gl_diff, slope,
         acceleration, cv, current, mean_g,
-        1.0, carbs, protein, fat,
+        1.0, float(carbs), float(protein), float(fat),
         spike, roc, time_of_day, is_post_meal, activity_level
     ], dtype=np.float32)
 
-
-def build_lstm_input(cgm_readings, carbs=0, protein=0, fat=0, window_size=30) -> np.ndarray:
+def build_lstm_input(cgm_readings, carbs=0, protein=0, fat=0, window_size=36) -> np.ndarray:
     cgm = np.array(cgm_readings, dtype=np.float32)
     if len(cgm) < 10:
         cgm = np.pad(cgm, (10 - len(cgm), 0), mode='edge')
@@ -87,7 +80,6 @@ def build_lstm_input(cgm_readings, carbs=0, protein=0, fat=0, window_size=30) ->
     assert seq.shape == (window_size, 18), f"Sequence shape mismatch: {seq.shape}, expected ({window_size}, 18)"
     return seq
 
-
 class LSTMEncoder(nn.Module):
     def __init__(self, input_size, hidden_size=128, n_horizons=3):
         super().__init__()
@@ -95,15 +87,18 @@ class LSTMEncoder(nn.Module):
             input_size=input_size,
             hidden_size=hidden_size,
             num_layers=2,
-            batch_first=True
+            batch_first=True,
+            dropout=0.2
         )
         self.embedding = nn.Sequential(
             nn.Linear(hidden_size, 128),
             nn.BatchNorm1d(128),
             nn.ReLU(),
+            nn.Dropout(0.2),
             nn.Linear(128, 64),
             nn.BatchNorm1d(64),
-            nn.ReLU()
+            nn.ReLU(),
+            nn.Dropout(0.2)
         )
         self.output = nn.Linear(64, n_horizons)
 
@@ -114,7 +109,6 @@ class LSTMEncoder(nn.Module):
     def get_embedding(self, x):
         _, (h, _) = self.lstm(x)
         return self.embedding(h[-1])
-
 
 def _probe_scaler(scaler, n_horizons=3):
     try:
@@ -128,7 +122,6 @@ def _probe_scaler(scaler, n_horizons=3):
     except Exception:
         pass
     return 'none'
-
 
 class PredictionEngine:
     def __init__(self, config: Config):
@@ -166,7 +159,11 @@ class PredictionEngine:
             strict=False
         )
         self.lstm.eval()
-        print("✓ LSTM loaded (strict=False)")
+        
+        # CRITICAL FIX: Freeze LSTM
+        for param in self.lstm.parameters():
+            param.requires_grad = False
+        print("✓ LSTM loaded and frozen")
 
         tabnet_path = os.path.join(base, "tabnet_on_learned_embeddings.zip")
         if not os.path.exists(tabnet_path):
@@ -175,21 +172,26 @@ class PredictionEngine:
         self.tabnet.load_model(tabnet_path)
         print("✓ TabNet loaded")
 
+        # Load embedding scaler
+        embedding_scaler_path = os.path.join(base, "embedding_scaler.pkl")
+        if os.path.exists(embedding_scaler_path):
+            self.embedding_scaler = joblib.load(embedding_scaler_path)
+            print("✓ Embedding scaler loaded")
+        else:
+            print("⚠️ No embedding scaler found - using identity")
+            self.embedding_scaler = None
+
     def _scale_features(self, x: np.ndarray) -> np.ndarray:
-        """Scale features + remove NaNs"""
         if self.feature_scaler is None:
             raise ValueError("❌ Feature scaler missing!")
-
         original_shape = x.shape
         x_flat = x.reshape(-1, x.shape[-1])
         x_scaled = self.feature_scaler.transform(x_flat)
-        x_scaled = np.nan_to_num(x_scaled)
+        x_scaled = np.nan_to_num(x_scaled, nan=0.0, posinf=0.0, neginf=0.0)
         return x_scaled.reshape(original_shape)
 
     def _inverse_scale(self, raw: np.ndarray) -> np.ndarray:
-        """Safe glucose inverse scaling"""
         raw = np.array(raw, dtype=np.float32).reshape(-1)
-
         if self.scaler_mode == 'multi':
             return self.scaler.inverse_transform(raw.reshape(1, -1)).flatten()
         elif self.scaler_mode == 'single':
@@ -212,12 +214,19 @@ class PredictionEngine:
 
         emb = emb.reshape(emb.shape[0], -1)
         
-        print(f"EMBEDDING STATS:")
-        print(f"  min: {emb.min():.4f}, max: {emb.max():.4f}, mean: {emb.mean():.4f}, std: {emb.std():.4f}")
+        # CRITICAL FIX: Use embedding scaler if available
+        if self.embedding_scaler is not None:
+            emb = self.embedding_scaler.transform(emb)
+        else:
+            # Fallback normalization
+            emb = (emb - np.mean(emb, axis=0)) / (np.std(emb, axis=0) + 1e-6)
+        
+        emb = np.nan_to_num(emb, nan=0.0, posinf=0.0, neginf=0.0)
 
         raw = self.tabnet.predict(emb)
         raw = np.array(raw, dtype=np.float32).flatten()
 
+        # Physiological clamp
         raw = np.clip(raw, 50, 250)
         
         pred = self._inverse_scale(raw)
@@ -227,7 +236,6 @@ class PredictionEngine:
             base_val = float(pred[0])
             pred = np.array([base_val, base_val * 1.01, base_val * 1.02], dtype=np.float32)
 
-        print(f"Final predictions (30/60/90 min): {pred}")
         return pred
 
     def compute_risk(self, current: float, predictions: np.ndarray) -> Dict:
@@ -251,7 +259,6 @@ class PredictionEngine:
             "predictions": predictions.tolist(),
             "requires_action": risk_level in ["MEDIUM", "HIGH"]
         }
-
 
 def load_food_database(food_file: str) -> pd.DataFrame:
     for sheet in ["GI & Nutrition Data", "Sheet1", 0]:
@@ -295,7 +302,6 @@ def load_food_database(food_file: str) -> pd.DataFrame:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
     print(f"✓ Food DB ready | GI range: {df['GI'].min():.0f}–{df['GI'].max():.0f}")
     return df
-
 
 class FoodRankingEngine:
     def _normalize(self, x: np.ndarray) -> np.ndarray:
@@ -389,7 +395,6 @@ class FoodRankingEngine:
                 plan[meal] = []
         return plan
 
-
 class ActivityEngine:
     def recommend(self, risk_info: Dict) -> Dict:
         risk = risk_info["risk_level"]
@@ -440,7 +445,6 @@ class ActivityEngine:
                 "urgency_score": 0.2
             }
 
-
 class ClinicalOrchestrator:
     def __init__(self, config: Config):
         self.config = config
@@ -474,7 +478,7 @@ class ClinicalOrchestrator:
             "predictions": {
                 "30min": float(predictions[0]),
                 "60min": float(predictions[1]),
-                "90min": float(predictions[2])
+                "120min": float(predictions[2])
             },
             "food_recommendations": food_recs,
             "meal_plan": meal_plan,
