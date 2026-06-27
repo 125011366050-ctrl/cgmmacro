@@ -1,5 +1,4 @@
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
 import joblib
@@ -21,8 +20,8 @@ class Config:
     INPUT_SIZE = 18
 
 
-class LSTMWithEmbeddingOutput(nn.Module):
-    def __init__(self, input_size, hidden_size=128, n_horizons=3):
+class LSTMEncoder(nn.Module):
+    def __init__(self, input_size, hidden_size=128):
         super().__init__()
         self.lstm = nn.LSTM(
             input_size=input_size,
@@ -31,17 +30,14 @@ class LSTMWithEmbeddingOutput(nn.Module):
             batch_first=True
         )
         self.embedding = nn.Sequential(
-            nn.Linear(hidden_size, 128),
-            nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU()
+            nn.Linear(hidden_size, 64),       # embedding.0  (has weight+bias)
+            nn.BatchNorm1d(64),               # embedding.1  (has weight only — gamma)
+            nn.Linear(64, 64, bias=False)     # embedding.2  (no bias)
         )
-        self.output = nn.Linear(64, n_horizons)
 
     def forward(self, x):
         _, (h, _) = self.lstm(x)
-        emb = self.embedding(h[-1])
-        return self.output(emb)
+        return self.embedding(h[-1])
 
     def get_embedding(self, x):
         _, (h, _) = self.lstm(x)
@@ -64,19 +60,17 @@ class PredictionEngine:
         self.scaler = joblib.load(scaler_path)
         print("Scaler loaded")
 
-        input_size = self.config.INPUT_SIZE
-        print("Input size:", input_size)
-
-        self.lstm = LSTMWithEmbeddingOutput(
-            input_size=input_size,
-            hidden_size=self.config.HIDDEN_SIZE,
-            n_horizons=self.config.N_HORIZONS
+        self.lstm = LSTMEncoder(
+            input_size=self.config.INPUT_SIZE,
+            hidden_size=self.config.HIDDEN_SIZE
         ).to(self.device)
 
         lstm_path = os.path.join(base, "lstm_encoder_trained.pth")
         if not os.path.exists(lstm_path):
-            raise FileNotFoundError(f"Missing LSTM model: {lstm_path}")
-        self.lstm.load_state_dict(torch.load(lstm_path, map_location=self.device))
+            raise FileNotFoundError(f"Missing LSTM: {lstm_path}")
+
+        state = torch.load(lstm_path, map_location=self.device)
+        self.lstm.load_state_dict(state, strict=True)
         self.lstm.eval()
         print("LSTM loaded")
 
@@ -87,8 +81,6 @@ class PredictionEngine:
             raise FileNotFoundError(f"Missing TabNet: {tabnet_path}")
         self.tabnet.load_model(tabnet_path)
         print("TabNet loaded")
-
-        self.embedding_dim = self.config.HIDDEN_SIZE
 
     def predict_glucose(self, x):
         if len(x.shape) == 2:
