@@ -1,134 +1,77 @@
 import streamlit as st
 import numpy as np
-import torch
-import joblib
-from datetime import datetime
-from model import LSTMWithPredictionHead
-from pytorch_tabnet.tab_model import TabNetRegressor
+import pandas as pd
+from reco import ClinicalOrchestrator, Config
 
-# ----------------------------
-# PAGE CONFIG
-# ----------------------------
-st.set_page_config(page_title="CGM AI System", page_icon="🩸")
-st.title("🩸 CGM Prediction System (LSTM + TabNet)")
-st.write("Predict glucose levels for next 30, 60, 120 minutes")
+st.set_page_config(page_title="CDSS AI System", page_icon="🩸")
 
-# ----------------------------
-# LOAD MODELS
-# ----------------------------
+st.title("🩸 Diabetes CDSS Recommendation System")
+
 @st.cache_resource
-def load_models():
-    cfg = joblib.load("cgmacros_cleaned/model_config.pkl")
+def load_system():
+    config = Config()
+    system = ClinicalOrchestrator(config)
+    return system
 
-    lstm = LSTMWithPredictionHead(
-        cfg["input_size"],
-        cfg["hidden_size"],
-        cfg["n_horizons"]
+system = load_system()
+
+st.header("Patient Input")
+
+glucose = st.number_input("Current Glucose", 40.0, 400.0, 120.0)
+heart_rate = st.number_input("Heart Rate", 40.0, 180.0, 80.0)
+calories = st.number_input("Calories", 0.0, 2000.0, 250.0)
+carbs = st.number_input("Carbs", 0.0, 300.0, 40.0)
+protein = st.number_input("Protein", 0.0, 200.0, 20.0)
+fat = st.number_input("Fat", 0.0, 200.0, 10.0)
+fiber = st.number_input("Fiber", 0.0, 100.0, 5.0)
+
+meal_flag = 1
+
+# dummy window (IMPORTANT)
+def create_window(glucose):
+    window_size = 36
+    features = 18
+    base = np.zeros((window_size, features), dtype=np.float32)
+
+    base[:, 0] = glucose  # GL
+    base[:, 7] = heart_rate
+    base[:, 10] = calories
+    base[:, 11] = carbs
+    base[:, 12] = protein
+    base[:, 13] = fat
+    base[:, 14] = fiber
+    base[:, 9] = meal_flag
+
+    return base
+
+if st.button("Predict & Recommend"):
+
+    x_window = create_window(glucose)
+
+    result = system.run(
+        current_glucose=glucose,
+        x_window=x_window,
+        top_k=5
     )
 
-    lstm.load_state_dict(
-        torch.load("cgmacros_cleaned/lstm_model.pth", map_location="cpu")
-    )
-    lstm.eval()
+    st.subheader("📊 Risk Analysis")
+    st.write(result["risk"])
 
-    tabnet = TabNetRegressor()
-    tabnet.load_model("cgmacros_cleaned/tabnet_on_learned_embeddings.zip")
+    st.subheader("📈 Predictions")
+    st.write(result["predictions"])
 
-    feature_scaler = joblib.load("cgmacros_cleaned/feature_scaler.pkl")
-    glucose_scaler = joblib.load("cgmacros_cleaned/glucose_scaler.pkl")
+    st.subheader("🏃 Activity Recommendation")
+    st.write(result["activity"])
 
-    return cfg, lstm, tabnet, feature_scaler, glucose_scaler
+    st.subheader("🍛 Food Recommendations")
 
-cfg, lstm, tabnet, feature_scaler, glucose_scaler = load_models()
+    df = pd.DataFrame(result["food_recommendations"])
+    if not df.empty:
+        st.dataframe(df)
+    else:
+        st.warning("No food recommendations available")
 
-WINDOW = cfg["window_size"] if "window_size" in cfg else 36
+    st.subheader("🍽️ Meal Plan")
+    st.json(result["meal_plan"])
 
-# ----------------------------
-# INPUT UI
-# ----------------------------
-st.header("Patient Inputs")
-
-glucose = st.number_input("Current Glucose (mg/dL)", 40.0, 400.0, 110.0)
-hr = st.number_input("Heart Rate (bpm)", 40.0, 180.0, 80.0)
-meal = st.radio("Meal Taken?", ["Yes", "No"])
-carbs = st.number_input("Carbohydrates (g)", 0.0, 300.0, 40.0)
-protein = st.number_input("Protein (g)", 0.0, 200.0, 20.0)
-fat = st.number_input("Fat (g)", 0.0, 200.0, 10.0)
-
-# Time features
-now = datetime.now()
-hour = now.hour
-day = now.weekday()
-isnight = 1 if (hour < 6 or hour >= 22) else 0
-
-meal_flag = 1 if meal == "Yes" else 0
-
-# ----------------------------
-# FEATURE VECTOR (MUST MATCH TRAINING ORDER)
-# ----------------------------
-features = np.array([[
-    glucose,          # GL
-    glucose,          # GL_MA_5
-    5.0,              # GL_STD_5
-    0.0,              # GL_Diff
-    0.0,              # GL_Slope
-    0.0,              # GL_Acceleration
-    0.1,              # CV_Glucose
-    hr,               # HR
-    hr,               # HR_MA_5
-    meal_flag,       # Meal_Flag
-    carbs,           # Calories (approx)
-    carbs,           # Carbs
-    protein,
-    fat,
-    5.0,              # Fiber placeholder
-    hour,
-    day,
-    isnight
-]], dtype=np.float32)
-
-# ----------------------------
-# PREDICT
-# ----------------------------
-if st.button("Predict Glucose"):
-
-    # Scale features
-    row_scaled = feature_scaler.transform(features)
-
-    # Create sequence window
-    X = np.repeat(row_scaled[:, None, :], WINDOW, axis=1)
-
-    # LSTM embedding
-    with torch.no_grad():
-        emb = lstm.get_embedding(torch.tensor(X).float()).numpy()
-
-    # TabNet prediction
-    pred = tabnet.predict(emb.astype(np.float32))
-
-    # Inverse transform to mg/dL
-    pred = glucose_scaler.inverse_transform(
-        pred.reshape(-1, 1)
-    ).reshape(pred.shape)
-
-    pred = np.clip(pred, 40, 400)[0]
-
-    # ----------------------------
-    # OUTPUT
-    # ----------------------------
-    labels = ["30 min", "60 min", "120 min"]
-
-    st.success("Prediction Complete")
-
-    for i, label in enumerate(labels):
-        value = pred[i]
-
-        st.metric(label, f"{value:.1f} mg/dL")
-
-        if value < 80:
-            st.success("🟢 Low glucose risk")
-        elif value < 140:
-            st.info("🟡 Normal range")
-        elif value < 180:
-            st.warning("🟠 Elevated")
-        else:
-            st.error("🔴 High risk")
+    st.success("Prediction completed")
