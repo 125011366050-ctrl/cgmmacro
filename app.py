@@ -13,7 +13,7 @@ def load_system():
     config = Config()
     config.DATA_PATH = BASE_DIR
     config.INPUT_SIZE = 18
-    config.FOOD_FILE = os.path.join(BASE_DIR, "Indian_Foods_GI_GL_Database.xlsx")
+    config.FOOD_FILE = os.path.join(BASE_DIR, "Indian_Foods_GI_GL_Database (1).xlsx")
     return ClinicalOrchestrator(config)
 
 
