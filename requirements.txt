@@ -6,3 +6,4 @@ scikit-learn
 joblib
 openpyxl
 pytorch-tabnet
+plotly==5.18.0
