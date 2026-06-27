@@ -32,6 +32,8 @@ class Config:
     HIGH_RISK_GL_MAX: float = 15.0
     MEDIUM_RISK_GI_MAX: float = 55.0
     MEDIUM_RISK_GL_MAX: float = 20.0
+    MAX_DROP_PER_STEP: float = 30.0
+    MAX_RISE_PER_STEP: float = 60.0
 
 def build_cgm_features(g: np.ndarray, carbs=0, protein=0, fat=0) -> np.ndarray:
     g = np.array(g, dtype=np.float32)
@@ -204,13 +206,36 @@ class PredictionEngine:
             print(f"⚠️ inverse_scale failed: {e} — returning raw")
             return raw.copy()
 
+    def _apply_physiology_clamp(self, pred: np.ndarray, current: float) -> np.ndarray:
+        """
+        Enforce physiological continuity.
+        Max natural drop: ~30 mg/dL per 30-min horizon
+        Max natural rise: ~60 mg/dL per 30-min horizon (post-meal)
+        """
+        max_drop = self.config.MAX_DROP_PER_STEP
+        max_rise = self.config.MAX_RISE_PER_STEP
+        pred = pred.copy()
+
+        pred[0] = np.clip(pred[0], current - max_drop, current + max_rise)
+        pred[1] = np.clip(pred[1], pred[0] - max_drop, pred[0] + max_rise)
+        pred[2] = np.clip(pred[2], pred[1] - max_drop, pred[1] + max_rise)
+
+        if np.any(np.diff(pred) < -40):
+            print("⚠️ Physiology violation detected — applying smoothing")
+            pred[1] = (pred[0] + pred[2]) / 2.0
+
+        return pred
+
     def predict_glucose(self, x: np.ndarray) -> np.ndarray:
         if len(x.shape) == 2:
             x = x[np.newaxis, :, :]
         x = x.astype(np.float32)
 
-        x = self._scale_features(x)
-        t = torch.from_numpy(x).float().to(self.device)
+        # Extract current glucose from raw (unscaled) input before scaling
+        current_glucose = float(x[0, -1, 0])
+
+        x_scaled = self._scale_features(x)
+        t = torch.from_numpy(x_scaled).float().to(self.device)
 
         with torch.no_grad():
             emb = self.lstm.get_embedding(t).cpu().numpy().astype(np.float32)
@@ -221,7 +246,10 @@ class PredictionEngine:
         if self.embedding_scaler is not None:
             emb = self.embedding_scaler.transform(emb)
         else:
-            emb = (emb - np.mean(emb, axis=0)) / (np.std(emb, axis=0) + 1e-6)
+            # z-norm per feature, not global — more stable
+            emb_mean = np.mean(emb, axis=1, keepdims=True)
+            emb_std = np.std(emb, axis=1, keepdims=True)
+            emb = (emb - emb_mean) / (emb_std + 1e-6)
 
         emb = np.nan_to_num(emb, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -240,14 +268,25 @@ class PredictionEngine:
             base_val = float(pred[0])
             pred = np.array([base_val, base_val, base_val], dtype=np.float32)
 
+        # Apply physiological clamp using ORIGINAL current glucose
+        pred = self._apply_physiology_clamp(pred, current_glucose)
+        print(f"[DEBUG] After physiology clamp: {pred} | current was: {current_glucose:.1f}")
+
         return pred
 
     def compute_risk(self, current: float, predictions: np.ndarray) -> Dict:
         peak = float(np.max(predictions))
-        spike = max(0.0, peak - current)
+        trough = float(np.min(predictions))
+
+        # Use signed spike — both directions matter
+        raw_spike = float(peak - current)
+        spike = abs(raw_spike)
         trend = float(predictions[0] - current)
 
-        if current >= self.config.CRITICAL_GLUCOSE or spike >= self.config.MEDIUM_SPIKE:
+        # Hypoglycemia check
+        hypo_risk = trough < 70.0
+
+        if current >= self.config.CRITICAL_GLUCOSE or spike >= self.config.MEDIUM_SPIKE or hypo_risk:
             risk_level = "HIGH"
         elif current >= self.config.WARNING_GLUCOSE or spike >= self.config.LOW_SPIKE:
             risk_level = "MEDIUM"
@@ -257,9 +296,12 @@ class PredictionEngine:
         return {
             "risk_level": risk_level,
             "spike": spike,
+            "raw_spike": raw_spike,
             "trend": trend,
             "peak": peak,
+            "trough": trough,
             "current": float(current),
+            "hypo_risk": hypo_risk,
             "predictions": predictions.tolist(),
             "requires_action": risk_level in ["MEDIUM", "HIGH"]
         }
@@ -404,7 +446,20 @@ class ActivityEngine:
         risk = risk_info["risk_level"]
         glucose = risk_info["current"]
         spike = risk_info["spike"]
-        if glucose >= 200 or spike > 60:
+        hypo = risk_info.get("hypo_risk", False)
+
+        if hypo:
+            return {
+                "activity": "REST — Do NOT exercise",
+                "duration": "Until glucose > 90 mg/dL",
+                "timing": "IMMEDIATELY check glucose",
+                "intensity": "None",
+                "calorie_burn": "0 kcal",
+                "clinical_alert": "🚨 HYPOGLYCEMIA RISK — Consume fast-acting carbs now",
+                "evidence": "Exercise contraindicated below 70 mg/dL",
+                "urgency_score": 1.0
+            }
+        elif glucose >= 200 or spike > 60:
             return {
                 "activity": "URGENT — Brisk Walking",
                 "duration": "40-45 minutes",
@@ -472,8 +527,12 @@ class ClinicalOrchestrator:
 
         predictions = self.prediction_engine.predict_glucose(x)
         risk_info = self.prediction_engine.compute_risk(current_glucose, predictions)
-        food_recs = self.ranking_engine.rank(self.food_df, risk_info["risk_level"], current_glucose, top_k=top_k)
-        meal_plan = self.ranking_engine.meal_plan(self.food_df, risk_info["risk_level"], current_glucose)
+        food_recs = self.ranking_engine.rank(
+            self.food_df, risk_info["risk_level"], current_glucose, top_k=top_k
+        )
+        meal_plan = self.ranking_engine.meal_plan(
+            self.food_df, risk_info["risk_level"], current_glucose
+        )
         activity = self.activity_engine.recommend(risk_info)
 
         return {
