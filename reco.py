@@ -39,6 +39,7 @@ class Config:
     DROP_MODERATE_ALERT: float = 50.0
     DROP_CAUTION: float = 35.0
 
+
 def build_cgm_features(g: np.ndarray, carbs=0, protein=0, fat=0) -> np.ndarray:
     g = np.array(g, dtype=np.float32)
     if len(g) < 3:
@@ -65,6 +66,7 @@ def build_cgm_features(g: np.ndarray, carbs=0, protein=0, fat=0) -> np.ndarray:
         spike, roc, time_of_day, is_post_meal, activity_level
     ], dtype=np.float32)
 
+
 def build_lstm_input(cgm_readings, carbs=0, protein=0, fat=0, window_size=36) -> np.ndarray:
     cgm = np.array(cgm_readings, dtype=np.float32)
     if len(cgm) < 10:
@@ -85,6 +87,7 @@ def build_lstm_input(cgm_readings, carbs=0, protein=0, fat=0, window_size=36) ->
     seq = np.array(sequence, dtype=np.float32)
     assert seq.shape == (window_size, 18), f"Sequence shape mismatch: {seq.shape}"
     return seq
+
 
 class LSTMEncoder(nn.Module):
     def __init__(self, input_size, hidden_size=128, n_horizons=3):
@@ -116,6 +119,7 @@ class LSTMEncoder(nn.Module):
         _, (h, _) = self.lstm(x)
         return self.embedding(h[-1])
 
+
 def _probe_scaler(scaler, n_horizons=3):
     try:
         scaler.inverse_transform(np.zeros((1, n_horizons)))
@@ -128,6 +132,26 @@ def _probe_scaler(scaler, n_horizons=3):
     except Exception:
         pass
     return 'none'
+
+
+def safe_risk(risk: dict) -> dict:
+    """Crash-proof accessor — works with both old and new key names."""
+    return {
+        "risk_level":      risk.get("risk_level", "LOW"),
+        "spike":           risk.get("upward_spike", risk.get("spike", 0.0)),
+        "upward_spike":    risk.get("upward_spike", risk.get("spike", 0.0)),
+        "drop":            risk.get("downward_drop", risk.get("drop", 0.0)),
+        "downward_drop":   risk.get("downward_drop", risk.get("drop", 0.0)),
+        "drop_severity":   risk.get("drop_severity", "NORMAL"),
+        "trend":           risk.get("trend", 0.0),
+        "peak":            risk.get("peak", 0.0),
+        "trough":          risk.get("trough", 0.0),
+        "current":         risk.get("current", 0.0),
+        "hypo_risk":       risk.get("hypo_risk", False),
+        "predictions":     risk.get("predictions", []),
+        "requires_action": risk.get("requires_action", False),
+    }
+
 
 class PredictionEngine:
     def __init__(self, config: Config):
@@ -213,69 +237,47 @@ class PredictionEngine:
         max_drop = self.config.MAX_DROP_PER_STEP
         max_rise = self.config.MAX_RISE_PER_STEP
         pred = pred.copy().astype(np.float32)
-        
-        # Gentle clamp - not too aggressive
         pred[0] = np.clip(pred[0], current - max_drop, current + max_rise)
         for i in range(1, len(pred)):
-            diff = pred[i] - pred[i-1]
+            diff = pred[i] - pred[i - 1]
             diff = np.clip(diff, -max_drop, max_rise)
-            pred[i] = pred[i-1] + diff
-        
-        # Add small noise for realism
+            pred[i] = pred[i - 1] + diff
         noise = self.rng.normal(0, self.config.PHYSIO_NOISE_STD, size=pred.shape).astype(np.float32)
         pred = pred + noise * 0.5
-        
         return pred
 
     def predict_glucose(self, x: np.ndarray) -> np.ndarray:
         if len(x.shape) == 2:
             x = x[np.newaxis, :, :]
         x = x.astype(np.float32)
-
         current_glucose = float(x[0, -1, 0])
-
         x_scaled = self._scale_features(x)
         t = torch.from_numpy(x_scaled).float().to(self.device)
-
         with torch.no_grad():
             emb = self.lstm.get_embedding(t).cpu().numpy().astype(np.float32)
-
         emb = emb.reshape(emb.shape[0], -1)
-        
-        # CRITICAL FIX: Stable embedding scaling
         if self.embedding_scaler is not None:
             emb = self.embedding_scaler.transform(emb)
         else:
             emb_mean = np.mean(emb, axis=1, keepdims=True)
             emb_std = np.std(emb, axis=1, keepdims=True)
             emb = (emb - emb_mean) / (emb_std + 1e-6)
-            emb = np.clip(emb, -5, 5)  # Prevent explosion
-
+            emb = np.clip(emb, -5, 5)
         emb = np.nan_to_num(emb, nan=0.0, posinf=0.0, neginf=0.0)
-
         raw = self.tabnet.predict(emb)
         raw = np.array(raw, dtype=np.float32).flatten()
-
         pred = self._inverse_scale(raw)
-        
-        # FIXED: Only apply final safety clip, not hard range
         pred = np.clip(pred, 40, 400)
-
         if len(pred) == 1:
             base_val = float(pred[0])
             pred = np.array([base_val, base_val * 1.01, base_val * 1.02], dtype=np.float32)
-
-        # Apply gentle physiology clamp only
         pred = self._apply_physiology_clamp(pred, current_glucose)
-        
-        # Ensure realistic 30/60/120 progression
-        if pred[0] > current_glucose:  # Rising
+        if pred[0] > current_glucose:
             pred[1] = min(pred[1], pred[0] + (pred[0] - current_glucose) * 0.5)
             pred[2] = min(pred[2], pred[1] + (pred[1] - pred[0]) * 0.3)
-        else:  # Falling
+        else:
             pred[1] = max(pred[1], pred[0] - (current_glucose - pred[0]) * 0.5)
             pred[2] = max(pred[2], pred[1] - (pred[0] - pred[1]) * 0.3)
-
         pred = np.clip(pred, 40, 400)
         return pred
 
@@ -292,41 +294,40 @@ class PredictionEngine:
     def compute_risk(self, current: float, predictions: np.ndarray) -> Dict:
         peak = float(np.max(predictions))
         trough = float(np.min(predictions))
-        
-        # CRITICAL FIX: Both directions tracked separately
         upward_spike = max(0.0, peak - current)
         downward_drop = max(0.0, current - trough)
-        
         drop_severity = self._classify_drop(downward_drop)
         trend = float(predictions[0] - current)
         hypo_risk = trough < 70.0
-        
-        # Graded risk classification
-        if (current >= self.config.CRITICAL_GLUCOSE or 
-            upward_spike >= self.config.MEDIUM_SPIKE or 
-            hypo_risk or 
-            drop_severity == "HIGH_ALERT"):
+
+        if (current >= self.config.CRITICAL_GLUCOSE or
+                upward_spike >= self.config.MEDIUM_SPIKE or
+                hypo_risk or
+                drop_severity == "HIGH_ALERT"):
             risk_level = "HIGH"
-        elif (current >= self.config.WARNING_GLUCOSE or 
-              upward_spike >= self.config.LOW_SPIKE or 
+        elif (current >= self.config.WARNING_GLUCOSE or
+              upward_spike >= self.config.LOW_SPIKE or
               drop_severity in ("MODERATE_ALERT", "CAUTION")):
             risk_level = "MEDIUM"
         else:
             risk_level = "LOW"
 
         return {
-            "risk_level": risk_level,
-            "upward_spike": upward_spike,   # FIXED: renamed from 'spike'
-            "downward_drop": downward_drop,
-            "drop_severity": drop_severity,
-            "trend": trend,
-            "peak": peak,
-            "trough": trough,
-            "current": float(current),
-            "hypo_risk": hypo_risk,
-            "predictions": predictions.tolist(),
+            "risk_level":      risk_level,
+            "upward_spike":    upward_spike,
+            "spike":           upward_spike,     # backward-compat alias
+            "downward_drop":   downward_drop,
+            "drop":            downward_drop,    # backward-compat alias
+            "drop_severity":   drop_severity,
+            "trend":           trend,
+            "peak":            peak,
+            "trough":          trough,
+            "current":         float(current),
+            "hypo_risk":       hypo_risk,
+            "predictions":     predictions.tolist(),
             "requires_action": risk_level in ["MEDIUM", "HIGH"]
         }
+
 
 def load_food_database(food_file: str) -> pd.DataFrame:
     for sheet in ["GI & Nutrition Data", "Sheet1", 0]:
@@ -368,12 +369,12 @@ def load_food_database(food_file: str) -> pd.DataFrame:
         df[col] = df[col].fillna(default)
     for col in ["GI", "GL", "Carbs", "Protein", "Fat", "Calories", "Fiber"]:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-
     df["GI"] = df["GI"].replace(0, np.nan)
     median_gi = df["GI"].median()
     df["GI"] = df["GI"].fillna(median_gi)
     print(f"✓ Food DB ready | GI range: {df['GI'].min():.0f}–{df['GI'].max():.0f} | median GI: {median_gi:.0f}")
     return df
+
 
 class FoodRankingEngine:
     def _normalize(self, x: np.ndarray) -> np.ndarray:
@@ -467,13 +468,15 @@ class FoodRankingEngine:
                 plan[meal] = []
         return plan
 
+
 class ActivityEngine:
     def recommend(self, risk_info: Dict) -> Dict:
+        risk_info = safe_risk(risk_info)
         risk = risk_info["risk_level"]
         glucose = risk_info["current"]
-        upward_spike = risk_info.get("upward_spike", 0)
-        hypo = risk_info.get("hypo_risk", False)
-        drop_sev = risk_info.get("drop_severity", "NORMAL")
+        upward_spike = risk_info["upward_spike"]
+        hypo = risk_info["hypo_risk"]
+        drop_sev = risk_info["drop_severity"]
 
         if hypo:
             return {
@@ -564,6 +567,7 @@ class ActivityEngine:
                 "urgency_score": 0.2
             }
 
+
 class ClinicalOrchestrator:
     def __init__(self, config: Config):
         self.config = config
@@ -587,13 +591,19 @@ class ClinicalOrchestrator:
 
         predictions = self.prediction_engine.predict_glucose(x)
         risk_info = self.prediction_engine.compute_risk(current_glucose, predictions)
-        food_recs = self.ranking_engine.rank(self.food_df, risk_info["risk_level"], current_glucose, top_k=top_k)
-        meal_plan = self.ranking_engine.meal_plan(self.food_df, risk_info["risk_level"], current_glucose)
+        risk_safe = safe_risk(risk_info)
+
+        food_recs = self.ranking_engine.rank(
+            self.food_df, risk_safe["risk_level"], current_glucose, top_k=top_k
+        )
+        meal_plan = self.ranking_engine.meal_plan(
+            self.food_df, risk_safe["risk_level"], current_glucose
+        )
         activity = self.activity_engine.recommend(risk_info)
 
         return {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "risk": risk_info,
+            "risk": risk_safe,
             "predictions": {
                 "30min": float(predictions[0]),
                 "60min": float(predictions[1]),
