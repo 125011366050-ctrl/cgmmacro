@@ -1,7 +1,3 @@
-# ============================================================================
-# APP.PY - FINAL VERSION (NO CHANGES NEEDED)
-# ============================================================================
-
 import streamlit as st
 import numpy as np
 import os
@@ -11,15 +7,14 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 from reco import ClinicalOrchestrator, Config
 
-
 @st.cache_resource
 def load_system():
     config = Config()
     config.DATA_PATH = BASE_DIR
     config.INPUT_SIZE = 18
+    config.WINDOW_SIZE = 36
     config.FOOD_FILE = os.path.join(BASE_DIR, "Indian_Foods_GI_GL_Database (1).xlsx")
     return ClinicalOrchestrator(config)
-
 
 st.set_page_config(page_title="CDSS — Glucose & Nutrition", layout="wide")
 st.title("🩺 Clinical Decision Support System")
@@ -104,7 +99,7 @@ if st.button("🔍 Run Full Analysis", use_container_width=True):
             c1, c2, c3 = st.columns(3)
             c1.metric("30 min", f"{preds['30min']:.1f} mg/dL", delta=f"{preds['30min'] - current:+.1f}")
             c2.metric("60 min", f"{preds['60min']:.1f} mg/dL", delta=f"{preds['60min'] - current:+.1f}")
-            c3.metric("90 min", f"{preds['90min']:.1f} mg/dL", delta=f"{preds['90min'] - current:+.1f}")
+            c3.metric("120 min", f"{preds['120min']:.1f} mg/dL", delta=f"{preds['120min'] - current:+.1f}")
 
             st.markdown("---")
             st.subheader("⚠️ Risk Assessment")
@@ -128,7 +123,7 @@ if st.button("🔍 Run Full Analysis", use_container_width=True):
             st.subheader("🔬 CGM Signal Summary")
             g = np.array(cgm_inputs, dtype=np.float32)
             cgm_slope = float(np.polyfit(np.arange(10), g, 1)[0])
-            cgm_roc = float((g[-1] - g[-5]) / 5)
+            cgm_roc = float((g[-1] - g[-5]) / 5) if len(g) >= 6 else cgm_slope
             cgm_cv = float(np.std(g) / (np.mean(g) + 1e-6) * 100)
             cgm_mean = float(np.mean(g))
 
@@ -231,21 +226,4 @@ if st.button("🔍 Run Full Analysis", use_container_width=True):
                 top_gi = food_recs.iloc[0].get("GI", "N/A")
                 top_spike = food_recs.iloc[0].get("Predicted_Spike", 0.0)
 
-            urgency_label = "IMMEDIATE" if risk_level == "HIGH" else "SOON" if risk_level == "MEDIUM" else "ROUTINE"
-
-            st.code(f"""CLINICAL SUMMARY — {result['timestamp']}
-==========================================
-Risk Level       : {risk_level} ({urgency_label})
-Current Glucose  : {current:.0f} mg/dL
-Predicted Peak   : {peak:.0f} mg/dL
-Glucose Spike    : {spike:.1f} mg/dL
-30-min Trend     : {trend:+.1f} mg/dL
-Action Required  : {risk['requires_action']}
-
-Top Food         : {top_food} (GI: {top_gi}, Spike: +{top_spike:.1f})
-Activity         : {act_name} — {duration}
-Alert            : {alert}""", language="text")
-
-        except Exception as e:
-            st.error(f"❌ Analysis failed: {e}")
-            st.exception(e)
+            urgency_label = "IMMEDIATE"
