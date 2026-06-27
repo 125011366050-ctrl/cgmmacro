@@ -1,3 +1,7 @@
+# ============================================================================
+# RECO.PY - COMPLETE FIXED VERSION (WITH ALL CRITICAL FIXES)
+# ============================================================================
+
 import numpy as np
 import pandas as pd
 import torch
@@ -136,12 +140,10 @@ class PredictionEngine:
         base = self.config.DATA_PATH
 
         feature_scaler_path = os.path.join(base, "feature_scaler.pkl")
-        if os.path.exists(feature_scaler_path):
-            self.feature_scaler = joblib.load(feature_scaler_path)
-            print("✓ Feature scaler loaded")
-        else:
-            print("⚠️ Feature scaler not found — using raw features (may degrade performance)")
-            self.feature_scaler = None
+        if not os.path.exists(feature_scaler_path):
+            raise FileNotFoundError(f"❌ CRITICAL: Feature scaler missing at {feature_scaler_path}")
+        self.feature_scaler = joblib.load(feature_scaler_path)
+        print("✓ Feature scaler loaded")
 
         scaler_path = os.path.join(base, "glucose_scaler.pkl")
         if not os.path.exists(scaler_path):
@@ -173,34 +175,34 @@ class PredictionEngine:
         print("✓ TabNet loaded")
 
     def _scale_features(self, x: np.ndarray) -> np.ndarray:
-        """Scale input features using the feature scaler (crucial!)"""
+        """🔥 CRITICAL: Force correct feature scaling"""
         if self.feature_scaler is None:
-            return x
-        
+            raise ValueError("❌ Feature scaler missing — model will be unstable!")
+
         original_shape = x.shape
         x_flat = x.reshape(-1, x.shape[-1])
         x_scaled = self.feature_scaler.transform(x_flat)
         return x_scaled.reshape(original_shape)
 
     def _inverse_scale(self, raw: np.ndarray) -> np.ndarray:
-        raw = raw.flatten()
+        """Safe glucose inverse scaling"""
+        raw = np.array(raw, dtype=np.float32).reshape(-1)
+
         if self.scaler_mode == 'multi':
-            inp = raw.reshape(1, -1)
-            pred = self.scaler.inverse_transform(inp).flatten()
-            return pred
-        if self.scaler_mode == 'single':
-            pred = np.array([
+            return self.scaler.inverse_transform(raw.reshape(1, -1)).flatten()
+        elif self.scaler_mode == 'single':
+            return np.array([
                 self.scaler.inverse_transform([[v]])[0][0] for v in raw
             ])
-            return pred
-        return raw
+        else:
+            return raw
 
     def predict_glucose(self, x: np.ndarray) -> np.ndarray:
         if len(x.shape) == 2:
             x = x[np.newaxis, :, :]
         x = x.astype(np.float32)
         
-        # 🔥 CRITICAL: Scale features before model
+        # 🔥 CRITICAL: Scale features
         x = self._scale_features(x)
         
         t = torch.from_numpy(x).float().to(self.device)
@@ -208,8 +210,18 @@ class PredictionEngine:
         with torch.no_grad():
             emb = self.lstm.get_embedding(t).cpu().numpy().astype(np.float32)
 
+        # 🔥 FIX 4: Normalize embeddings before TabNet
+        emb_mean = emb.mean()
+        emb_std = emb.std() + 1e-6
+        emb = (emb - emb_mean) / emb_std
+        
         emb = emb.reshape(emb.shape[0], -1)
-        print(f"Embedding shape: {emb.shape} | range: [{emb.min():.4f}, {emb.max():.4f}]")
+        
+        print(f"EMBEDDING STATS AFTER NORM:")
+        print(f"  min: {emb.min():.4f}")
+        print(f"  max: {emb.max():.4f}")
+        print(f"  mean: {emb.mean():.4f}")
+        print(f"  std: {emb.std():.4f}")
 
         raw = self.tabnet.predict(emb)
         raw = np.array(raw, dtype=np.float32)
@@ -217,17 +229,17 @@ class PredictionEngine:
             raw = raw.reshape(1, -1)
         raw = raw.flatten()
 
-        if raw.max() < 5 or raw.max() > 1000:
-            pred = self._inverse_scale(raw)
-        else:
-            pred = raw
+        # 🔥 FIX 5: ALWAYS inverse scale (no conditional logic)
+        pred = self._inverse_scale(raw)
+        
+        # 🔥 FIX 7: Hard safety clamp
+        pred = np.clip(pred, 40, 400)
 
         if len(pred) == 1:
             base_val = float(pred[0])
             pred = np.array([base_val, base_val * 1.01, base_val * 1.02], dtype=np.float32)
 
-        pred = np.clip(pred[:3], 50, 400)
-        print(f"Predictions (30/60/90 min): {pred}")
+        print(f"Final predictions (30/60/90 min): {pred}")
         return pred
 
     def compute_risk(self, current: float, predictions: np.ndarray) -> Dict:
