@@ -8,6 +8,7 @@ import warnings
 from datetime import datetime
 from typing import Dict
 from dataclasses import dataclass
+from pytorch_tabnet.tab_model import TabNetRegressor
 
 warnings.filterwarnings('ignore')
 
@@ -50,16 +51,22 @@ def build_cgm_features(g: np.ndarray, carbs=0, protein=0, fat=0) -> np.ndarray:
     cv = float(std_g / (mean_g + 1e-6))
     roc = float((g[-1] - g[-5]) / 5) if len(g) >= 6 else slope
     GL = current + carbs * 2.0
+    time_of_day = 12.0
+    is_post_meal = 1.0
+    activity_level = 0.0
     return np.array([
         GL, gl_ma_5, gl_std_5, gl_diff, slope,
         acceleration, cv, current, mean_g,
         1.0, carbs, protein, fat,
-        spike, roc, 12.0, 1.0, 0.0
+        spike, roc, time_of_day, is_post_meal, activity_level
     ], dtype=np.float32)
 
 
 def build_lstm_input(cgm_readings, carbs=0, protein=0, fat=0, window_size=30) -> np.ndarray:
     cgm = np.array(cgm_readings, dtype=np.float32)
+    # pad if too short — never crash on short input
+    if len(cgm) < 10:
+        cgm = np.pad(cgm, (10 - len(cgm), 0), mode='edge')
     cgm_interp = np.interp(
         np.linspace(0, len(cgm) - 1, window_size),
         np.arange(len(cgm)), cgm
@@ -73,7 +80,9 @@ def build_lstm_input(cgm_readings, carbs=0, protein=0, fat=0, window_size=30) ->
             window = np.pad(window, (10 - len(window), 0), mode='edge')
         features = build_cgm_features(window, carbs=carbs, protein=protein, fat=fat)
         sequence.append(features)
-    return np.array(sequence, dtype=np.float32)
+    seq = np.array(sequence, dtype=np.float32)
+    assert seq.shape == (window_size, 18), f"Sequence shape mismatch: {seq.shape}, expected ({window_size}, 18)"
+    return seq
 
 
 class LSTMEncoder(nn.Module):
@@ -104,17 +113,18 @@ class LSTMEncoder(nn.Module):
         return self.embedding(h[-1])
 
 
-class RegressionHead(nn.Module):
-    def __init__(self, input_dim=64, n_horizons=3):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 32),
-            nn.ReLU(),
-            nn.Linear(32, n_horizons)
-        )
-
-    def forward(self, x):
-        return self.net(x)
+def _probe_scaler(scaler, n_horizons=3):
+    try:
+        scaler.inverse_transform(np.zeros((1, n_horizons)))
+        return 'multi'
+    except Exception:
+        pass
+    try:
+        scaler.inverse_transform(np.zeros((1, 1)))
+        return 'single'
+    except Exception:
+        pass
+    return 'none'
 
 
 class PredictionEngine:
@@ -130,7 +140,8 @@ class PredictionEngine:
         if not os.path.exists(scaler_path):
             raise FileNotFoundError(f"Missing scaler: {scaler_path}")
         self.scaler = joblib.load(scaler_path)
-        print("Scaler loaded")
+        self.scaler_mode = _probe_scaler(self.scaler, self.config.N_HORIZONS)
+        print(f"Scaler loaded — mode detected: {self.scaler_mode}")
 
         self.lstm = LSTMEncoder(
             input_size=self.config.INPUT_SIZE,
@@ -147,14 +158,28 @@ class PredictionEngine:
         self.lstm.eval()
         print("LSTM loaded")
 
-        self.regressor = RegressionHead(input_dim=64, n_horizons=self.config.N_HORIZONS).to(self.device)
-        reg_path = os.path.join(base, "regression_head.pth")
-        if os.path.exists(reg_path):
-            self.regressor.load_state_dict(torch.load(reg_path, map_location=self.device))
-            print("Regression head loaded from file")
-        else:
-            print("No regression_head.pth found — using untrained head (fallback to LSTM direct output)")
-        self.regressor.eval()
+        tabnet_path = os.path.join(base, "tabnet_on_learned_embeddings.zip")
+        if not os.path.exists(tabnet_path):
+            raise FileNotFoundError(f"Missing TabNet: {tabnet_path}")
+        self.tabnet = TabNetRegressor()
+        self.tabnet.load_model(tabnet_path)
+        print("TabNet loaded")
+
+    def _inverse_scale(self, raw: np.ndarray) -> np.ndarray:
+        raw = raw.flatten()
+        if self.scaler_mode == 'multi':
+            inp = raw.reshape(1, -1)
+            pred = self.scaler.inverse_transform(inp).flatten()
+            print(f"Inverse transform (multi): {raw} → {pred}")
+            return pred
+        if self.scaler_mode == 'single':
+            pred = np.array([
+                self.scaler.inverse_transform([[v]])[0][0] for v in raw
+            ])
+            print(f"Inverse transform (single loop): {raw} → {pred}")
+            return pred
+        print("WARNING: scaler unusable — returning raw output as-is")
+        return raw
 
     def predict_glucose(self, x: np.ndarray) -> np.ndarray:
         if len(x.shape) == 2:
@@ -163,21 +188,43 @@ class PredictionEngine:
         t = torch.from_numpy(x).float().to(self.device)
 
         with torch.no_grad():
-            emb = self.lstm.get_embedding(t)
-            raw = self.regressor(emb).cpu().numpy().flatten()
+            emb = self.lstm.get_embedding(t).cpu().numpy().astype(np.float32)
 
-        print(f"Regression head raw output: {raw}")
+        # always safe shape for TabNet
+        emb = emb.reshape(emb.shape[0], -1)
+        print(f"Embedding — shape: {emb.shape} | min: {emb.min():.4f} | max: {emb.max():.4f} | mean: {emb.mean():.4f} | std: {emb.std():.4f}")
 
-        # If regression_head.pth was trained on scaled targets, inverse transform.
-        # If outputs already look like glucose (>10), skip inverse transform.
-        if np.all(np.abs(raw) <= 10):
-            pred = self.scaler.inverse_transform(raw.reshape(-1, 1)).flatten()
-            print(f"After inverse transform: {pred}")
+        # warn if embedding looks wrong
+        if emb.max() > 100 or (emb.std() < 1e-4):
+            print("WARNING: embedding range looks abnormal — possible model mismatch")
+
+        raw = self.tabnet.predict(emb)
+        raw = np.array(raw, dtype=np.float32)
+        if raw.ndim == 1:
+            raw = raw.reshape(1, -1)
+        raw = raw.flatten()
+        print(f"TabNet raw output: {raw}")
+
+        # safe heuristic: glucose is always 50-400 mg/dL
+        # if max < 5  → definitely scaled down  → inverse transform
+        # if max > 1000 → definitely wrong scale → inverse transform
+        # otherwise → already in glucose range → use directly
+        if raw.max() < 5 or raw.max() > 1000:
+            print("Detected scaled/abnormal output → applying inverse transform")
+            pred = self._inverse_scale(raw)
         else:
+            print("Detected glucose-range output → using raw directly")
             pred = raw
-            print("Skipping inverse transform — outputs already in mg/dL range")
 
-        return np.clip(pred, 50, 400)
+        # if only 1 value returned (TabNet trained as single-output), extrapolate
+        if len(pred) == 1:
+            print("WARNING: single value returned — extrapolating to 3 horizons")
+            base_val = float(pred[0])
+            pred = np.array([base_val, base_val * 1.01, base_val * 1.02], dtype=np.float32)
+
+        pred = np.clip(pred[:3], 50, 400)
+        print(f"Final predictions (30/60/90 min): {pred}")
+        return pred
 
     def compute_risk(self, current: float, predictions: np.ndarray) -> Dict:
         peak = float(np.max(predictions))
@@ -401,6 +448,8 @@ class ClinicalOrchestrator:
 
     def run(self, cgm_readings, carbs=0, protein=0, fat=0, top_k=10) -> Dict:
         cgm_readings = list(cgm_readings)
+        if len(cgm_readings) < 10:
+            cgm_readings = ([cgm_readings[0]] * (10 - len(cgm_readings))) + cgm_readings
         current_glucose = float(cgm_readings[-1])
 
         sequence = build_lstm_input(
