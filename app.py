@@ -1,3 +1,7 @@
+# ============================================================================
+# APP.PY - COMPLETE FIXED VERSION
+# ============================================================================
+
 import streamlit as st
 import numpy as np
 import os
@@ -57,7 +61,7 @@ st.markdown("---")
 debug_mode = st.checkbox("🔧 Debug Mode", value=False)
 
 if st.button("🔍 Run Full Analysis", use_container_width=True):
-    with st.spinner("⚙️ Processing CGM data, scaling features, running inference..."):
+    with st.spinner("⚙️ Scaling features → LSTM → Embedding normalization → TabNet → Output..."):
         try:
             cgm_array = np.array(cgm_inputs, dtype=np.float32)
 
@@ -70,7 +74,7 @@ if st.button("🔍 Run Full Analysis", use_container_width=True):
                 st.write("CGM array:", cgm_array)
                 st.write("Shape:", cgm_array.shape)
                 st.write("Carbs / Protein / Fat:", meal_carbs, meal_protein, meal_fat)
-                st.write("CGM trend:", f"{cgm_array[-1] - cgm_array[0]:+.1f} mg/dL over 10 steps")
+                st.write("CGM trend:", f"{cgm_array[-1] - cgm_array[0]:+.1f} mg/dL")
 
             result = system.run(
                 cgm_readings=cgm_array,
@@ -93,7 +97,7 @@ if st.button("🔍 Run Full Analysis", use_container_width=True):
 
             if debug_mode:
                 st.markdown("### 🔧 Debug — Model Output")
-                st.write("Raw predictions:", preds)
+                st.write("Predictions:", preds)
                 st.write("Risk info:", risk)
 
             st.markdown("---")
