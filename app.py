@@ -54,11 +54,27 @@ with col_b:
 
 st.markdown("---")
 
+# debug mode toggle
+debug_mode = st.checkbox("🔧 Debug Mode", value=False)
+
 if st.button("🔍 Run Full Analysis", use_container_width=True):
     with st.spinner("Running prediction, food ranking, and activity plan..."):
         try:
+            cgm_array = np.array(cgm_inputs, dtype=np.float32)
+
+            # validate input range
+            if np.any(cgm_array < 50) or np.any(cgm_array > 400):
+                st.error("CGM values must be between 50 and 400 mg/dL")
+                st.stop()
+
+            if debug_mode:
+                st.markdown("### 🔧 Debug — Raw Input")
+                st.write("CGM array:", cgm_array)
+                st.write("Shape:", cgm_array.shape)
+                st.write("Carbs / Protein / Fat:", meal_carbs, meal_protein, meal_fat)
+
             result = system.run(
-                cgm_readings=np.array(cgm_inputs, dtype=np.float32),
+                cgm_readings=cgm_array,
                 carbs=meal_carbs,
                 protein=meal_protein,
                 fat=meal_fat,
@@ -75,6 +91,11 @@ if st.button("🔍 Run Full Analysis", use_container_width=True):
             activity = result["activity"]
             food_recs = result["food_recommendations"]
             meal_plan = result["meal_plan"]
+
+            if debug_mode:
+                st.markdown("### 🔧 Debug — Model Output")
+                st.write("Raw predictions:", preds)
+                st.write("Risk info:", risk)
 
             # ── GLUCOSE PREDICTIONS ──────────────────────────────
             st.markdown("---")
@@ -117,6 +138,15 @@ if st.button("🔍 Run Full Analysis", use_container_width=True):
             m2.metric("Trend Slope", f"{cgm_slope:+.2f} mg/dL/step")
             m3.metric("Rate of Change", f"{cgm_roc:+.2f} mg/dL/step")
             m4.metric("Variability (CV)", f"{cgm_cv:.1f}%")
+
+            # ── CGM CHART ────────────────────────────────────────
+            st.markdown("---")
+            st.subheader("📈 CGM Trend")
+            chart_data = pd.DataFrame({
+                "Reading": list(range(1, 11)),
+                "Glucose (mg/dL)": cgm_inputs
+            }).set_index("Reading")
+            st.line_chart(chart_data)
 
             # ── FOOD RECOMMENDATIONS ─────────────────────────────
             st.markdown("---")
