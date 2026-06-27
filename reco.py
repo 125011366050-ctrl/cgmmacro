@@ -100,8 +100,8 @@ class PredictionEngine:
             print("⚠️ Scaler doesn't have n_features_in_ attribute - assuming 1D")
         
        def get_path(file):
-    return os.path.join(BASE_DIR, file)
-joblib.load(get_path("glucose_scaler.pkl"))
+       return os.path.join(BASE_DIR, file)
+       joblib.load(get_path("glucose_scaler.pkl"))
         X_train = np.load(os.path.join(self.config.DATA_PATH, 'X_train.npy'))
         input_size = X_train.shape[2]
         
