@@ -41,7 +41,6 @@ if st.button("Run Prediction"):
         sample = X_test[0:1]
 
         result = system.run(current_glucose, sample)
-
         preds = result["predictions"]
         risk = result["risk"]
 
