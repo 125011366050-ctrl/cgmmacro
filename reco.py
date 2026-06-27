@@ -30,12 +30,12 @@ class LSTMEncoder(nn.Module):
             batch_first=True
         )
         self.embedding = nn.Sequential(
-            nn.Linear(hidden_size, 128),    # embedding.0
-            nn.BatchNorm1d(128),            # embedding.1
-            nn.ReLU(),                      # embedding.2
-            nn.Dropout(p=0.0),             # embedding.3
-            nn.Linear(128, 64),             # embedding.4
-            nn.BatchNorm1d(64),             # embedding.5
+            nn.Linear(hidden_size, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(p=0.0),
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64),
         )
         self.output = nn.Linear(64, n_horizons)
 
@@ -131,17 +131,3 @@ class ClinicalOrchestrator:
             "predictions": pred,
             "risk": risk
         }
-
-
-def main():
-    config = Config()
-    system = ClinicalOrchestrator(config)
-    X = np.load(os.path.join(config.DATA_PATH, "X_test.npy"))
-    sample = X[0:1]
-    result = system.run(120, sample)
-    print("\nRESULT:")
-    print(result)
-
-
-if __name__ == "__main__":
-    main()
