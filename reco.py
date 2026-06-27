@@ -1,5 +1,5 @@
 # ============================================================================
-# RECO.PY - COMPLETE FIXED VERSION (WITH ALL CRITICAL FIXES)
+# RECO.PY - COMPLETE FIXED VERSION (WITH ARCHITECTURE FIXES)
 # ============================================================================
 
 import numpy as np
@@ -54,7 +54,7 @@ def build_cgm_features(g: np.ndarray, carbs=0, protein=0, fat=0) -> np.ndarray:
     gl_diff = float(g[-1] - g[-2])
     cv = float(std_g / (mean_g + 1e-6))
     roc = float((g[-1] - g[-5]) / 5) if len(g) >= 6 else slope
-    GL = current + carbs * 2.0
+    GL = current
     time_of_day = 12.0
     is_post_meal = 1.0
     activity_level = 0.0
@@ -99,11 +99,9 @@ class LSTMEncoder(nn.Module):
         )
         self.embedding = nn.Sequential(
             nn.Linear(hidden_size, 128),
-            nn.BatchNorm1d(128),
             nn.ReLU(),
-            nn.Dropout(p=0.0),
-            nn.Linear(128, 64),
-            nn.BatchNorm1d(64),
+            nn.Dropout(0.1),
+            nn.Linear(128, 64)
         )
         self.output = nn.Linear(64, n_horizons)
 
@@ -175,13 +173,14 @@ class PredictionEngine:
         print("✓ TabNet loaded")
 
     def _scale_features(self, x: np.ndarray) -> np.ndarray:
-        """🔥 CRITICAL: Force correct feature scaling"""
+        """FIX A+B: Scale features and remove NaNs"""
         if self.feature_scaler is None:
             raise ValueError("❌ Feature scaler missing — model will be unstable!")
 
         original_shape = x.shape
         x_flat = x.reshape(-1, x.shape[-1])
         x_scaled = self.feature_scaler.transform(x_flat)
+        x_scaled = np.nan_to_num(x_scaled)
         return x_scaled.reshape(original_shape)
 
     def _inverse_scale(self, raw: np.ndarray) -> np.ndarray:
@@ -202,37 +201,26 @@ class PredictionEngine:
             x = x[np.newaxis, :, :]
         x = x.astype(np.float32)
         
-        # 🔥 CRITICAL: Scale features
         x = self._scale_features(x)
-        
         t = torch.from_numpy(x).float().to(self.device)
 
         with torch.no_grad():
             emb = self.lstm.get_embedding(t).cpu().numpy().astype(np.float32)
 
-        # 🔥 FIX 4: Normalize embeddings before TabNet
-        emb_mean = emb.mean()
-        emb_std = emb.std() + 1e-6
-        emb = (emb - emb_mean) / emb_std
-        
+        # FIX C: Force embedding normalization (CRITICAL)
+        emb = (emb - np.mean(emb)) / (np.std(emb) + 1e-6)
         emb = emb.reshape(emb.shape[0], -1)
         
         print(f"EMBEDDING STATS AFTER NORM:")
-        print(f"  min: {emb.min():.4f}")
-        print(f"  max: {emb.max():.4f}")
-        print(f"  mean: {emb.mean():.4f}")
-        print(f"  std: {emb.std():.4f}")
+        print(f"  min: {emb.min():.4f}, max: {emb.max():.4f}, mean: {emb.mean():.4f}, std: {emb.std():.4f}")
 
         raw = self.tabnet.predict(emb)
-        raw = np.array(raw, dtype=np.float32)
-        if raw.ndim == 1:
-            raw = raw.reshape(1, -1)
-        raw = raw.flatten()
+        raw = np.array(raw, dtype=np.float32).flatten()
 
-        # 🔥 FIX 5: ALWAYS inverse scale (no conditional logic)
-        pred = self._inverse_scale(raw)
+        # FIX E: Force consistent output scaling
+        raw = np.clip(raw, 50, 300)
         
-        # 🔥 FIX 7: Hard safety clamp
+        pred = self._inverse_scale(raw)
         pred = np.clip(pred, 40, 400)
 
         if len(pred) == 1:
