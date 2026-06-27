@@ -11,6 +11,7 @@ from reco import ClinicalOrchestrator, Config
 def load_system():
     config = Config()
     config.DATA_PATH = BASE_DIR
+    config.INPUT_SIZE = 18
     return ClinicalOrchestrator(config)
 
 
