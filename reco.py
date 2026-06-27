@@ -35,6 +35,7 @@ class Config:
     MAX_DROP_PER_STEP: float = 40.0
     MAX_RISE_PER_STEP: float = 60.0
     PHYSIO_NOISE_STD: float = 3.0
+    RAPID_DROP_THRESHOLD: float = 40.0
 
 def build_cgm_features(g: np.ndarray, carbs=0, protein=0, fat=0) -> np.ndarray:
     g = np.array(g, dtype=np.float32)
@@ -130,7 +131,7 @@ class PredictionEngine:
     def __init__(self, config: Config):
         self.config = config
         self.device = torch.device(config.DEVICE)
-        self.rng = np.random.default_rng(seed=42)
+        self.rng = np.random.default_rng(seed=config.SEED)
         self.load_models()
 
     def load_models(self):
@@ -207,29 +208,23 @@ class PredictionEngine:
             return raw.copy()
 
     def _apply_physiology_clamp(self, pred: np.ndarray, current: float) -> np.ndarray:
-        """
-        Soft physiological constraint — prevents impossible jumps
-        but allows realistic variability via controlled noise.
-        max_drop/rise loosened to 40/60 to avoid over-smoothing.
-        """
         max_drop = self.config.MAX_DROP_PER_STEP
         max_rise = self.config.MAX_RISE_PER_STEP
         pred = pred.copy().astype(np.float32)
 
-        # Soft clamp — each step relative to previous
+        # Physiological bounds relative to current, then step-by-step
         pred[0] = np.clip(pred[0], current - max_drop, current + max_rise)
         for i in range(1, len(pred)):
             pred[i] = np.clip(pred[i], pred[i-1] - max_drop, pred[i-1] + max_rise)
 
-        # Add physiological noise — CGM readings are never perfectly smooth
+        # Physiological noise — CGM is never a perfect straight line
         noise = self.rng.normal(0, self.config.PHYSIO_NOISE_STD, size=pred.shape).astype(np.float32)
         pred = pred + noise
 
-        # Detect and fix impossible straight-line collapse
+        # Curvature correction — prevent pure linear collapse
         diffs = np.diff(pred)
         if np.all(diffs < 0) and abs(pred[-1] - pred[0]) > 50:
             print("⚠️ Over-smoothing detected — applying curvature correction")
-            # Introduce mild curve: slight recovery at t=60 before continuing
             mid_correction = (pred[0] + pred[2]) / 2.0 + abs(pred[0] - pred[2]) * 0.15
             pred[1] = float(np.clip(mid_correction, pred[2], pred[0]))
 
@@ -270,13 +265,16 @@ class PredictionEngine:
         pred = self._inverse_scale(raw)
         print(f"[DEBUG] After inverse_scale: {pred}")
 
-        pred = np.clip(pred, 40, 400)
+        # Physiological clip relative to current — not hard 40/400
+        pred = np.clip(pred, current_glucose - 80, current_glucose + 120)
 
         if len(pred) == 1:
             base_val = float(pred[0])
             pred = np.array([base_val, base_val, base_val], dtype=np.float32)
 
         pred = self._apply_physiology_clamp(pred, current_glucose)
+
+        # Final safety clip
         pred = np.clip(pred, 40, 400)
         print(f"[DEBUG] Final pred: {pred} | current: {current_glucose:.1f}")
 
@@ -286,28 +284,46 @@ class PredictionEngine:
         peak   = float(np.max(predictions))
         trough = float(np.min(predictions))
 
-        # True spike = max future - current (floored at 0)
-        spike = max(0.0, peak - current)
+        # Upward spike — how much glucose will rise
+        upward_spike = max(0.0, peak - current)
+
+        # Downward drop — how much glucose will fall
+        downward_drop = max(0.0, current - trough)
+
+        # Clinical spike = whichever direction is more dangerous
+        spike = upward_spike
+
         trend = float(predictions[0] - current)
 
+        # Hypoglycemia risk
         hypo_risk = trough < 70.0
 
-        if current >= self.config.CRITICAL_GLUCOSE or spike >= self.config.MEDIUM_SPIKE or hypo_risk:
+        # Rapid drop risk — dangerous even without hypo
+        rapid_drop_risk = downward_drop > self.config.RAPID_DROP_THRESHOLD
+
+        if (current >= self.config.CRITICAL_GLUCOSE
+                or upward_spike >= self.config.MEDIUM_SPIKE
+                or hypo_risk):
             risk_level = "HIGH"
-        elif current >= self.config.WARNING_GLUCOSE or spike >= self.config.LOW_SPIKE:
+        elif (current >= self.config.WARNING_GLUCOSE
+                or upward_spike >= self.config.LOW_SPIKE
+                or rapid_drop_risk):
             risk_level = "MEDIUM"
         else:
             risk_level = "LOW"
 
         return {
-            "risk_level":     risk_level,
-            "spike":          spike,
-            "trend":          trend,
-            "peak":           peak,
-            "trough":         trough,
-            "current":        float(current),
-            "hypo_risk":      hypo_risk,
-            "predictions":    predictions.tolist(),
+            "risk_level":      risk_level,
+            "spike":           spike,
+            "upward_spike":    upward_spike,
+            "downward_drop":   downward_drop,
+            "trend":           trend,
+            "peak":            peak,
+            "trough":          trough,
+            "current":         float(current),
+            "hypo_risk":       hypo_risk,
+            "rapid_drop_risk": rapid_drop_risk,
+            "predictions":     predictions.tolist(),
             "requires_action": risk_level in ["MEDIUM", "HIGH"]
         }
 
@@ -351,6 +367,10 @@ def load_food_database(food_file: str) -> pd.DataFrame:
         df[col] = df[col].fillna(default)
     for col in ["GI", "GL", "Carbs", "Protein", "Fat", "Calories", "Fiber"]:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+    # Replace zero GI with median — zero means missing data, not truly zero GI
+    median_gi = df[df["GI"] > 0]["GI"].median()
+    df.loc[df["GI"] == 0, "GI"] = median_gi
     print(f"✓ Food DB ready | GI range: {df['GI'].min():.0f}–{df['GI'].max():.0f}")
     return df
 
@@ -360,15 +380,10 @@ class FoodRankingEngine:
         return (x - mn) / (mx - mn + 1e-8) if mx > mn else np.ones_like(x) * 0.5
 
     def estimate_spike(self, food: dict, current_glucose: float) -> float:
-        gi    = float(food.get("GI", 55))
-        carbs = float(food.get("Carbs", 30))
-        fiber = float(food.get("Fiber", 0))
+        gi      = float(food.get("GI", 55))
+        carbs   = float(food.get("Carbs", 30))
+        fiber   = float(food.get("Fiber", 0))
         protein = float(food.get("Protein", 5))
-
-        # Skip foods with suspiciously zero GI — likely missing data
-        if gi == 0:
-            gi = 55.0
-
         effective_carbs = max(0.0, carbs - fiber * 0.5)
         spike = (gi / 100.0) * (effective_carbs / 50.0) * 40.0
         spike *= max(0.7, 1.0 - protein * 0.01)
@@ -376,18 +391,20 @@ class FoodRankingEngine:
 
     def filter_by_risk(self, df: pd.DataFrame, risk_level: str) -> pd.DataFrame:
         if risk_level == "HIGH":
-            filtered = df[(df["GI"] > 0) & (df["GI"] <= 40) & (df["GL"] <= 15)]
+            filtered = df[df["GI"] <= 40]
             if len(filtered) < 5:
-                filtered = df[(df["GI"] > 0) & (df["GI"] <= 55) & (df["GL"] <= 20)]
+                filtered = df[df["GI"] <= 55]
         elif risk_level == "MEDIUM":
-            filtered = df[(df["GI"] > 0) & (df["GI"] <= 55) & (df["GL"] <= 20)]
+            filtered = df[df["GI"] <= 55]
             if len(filtered) < 5:
-                filtered = df[(df["GI"] > 0) & (df["GI"] <= 70)]
+                filtered = df[df["GI"] <= 70]
         else:
-            filtered = df[df["GI"] > 0].copy()
+            filtered = df.copy()
 
+        # Safe fallback — always lowest GI foods, never random
         if len(filtered) < 5:
-            filtered = df[df["GI"] > 0].nsmallest(max(10, len(df) // 2), "GI")
+            filtered = df.nsmallest(50, "GI")
+
         return filtered.reset_index(drop=True)
 
     def rank(self, df: pd.DataFrame, risk_level: str,
@@ -443,8 +460,9 @@ class FoodRankingEngine:
                 subset = df[df["Category"].str.contains(pattern, case=False, na=False)]
             else:
                 subset = pd.DataFrame()
+            # Safe fallback — lowest GI foods, never random sample
             if len(subset) < 3:
-                subset = df.sample(min(30, len(df)), random_state=42)
+                subset = df.nsmallest(50, "GI")
             ranked = self.rank(subset, risk_level, current_glucose, top_k=3)
             if not ranked.empty:
                 plan[meal] = ranked[["Food_Name", "GI", "GL", "Predicted_Spike", "Score"]].to_dict("records")
@@ -454,10 +472,11 @@ class FoodRankingEngine:
 
 class ActivityEngine:
     def recommend(self, risk_info: Dict) -> Dict:
-        risk    = risk_info["risk_level"]
-        glucose = risk_info["current"]
-        spike   = risk_info["spike"]
-        hypo    = risk_info.get("hypo_risk", False)
+        risk       = risk_info["risk_level"]
+        glucose    = risk_info["current"]
+        spike      = risk_info["spike"]
+        hypo       = risk_info.get("hypo_risk", False)
+        rapid_drop = risk_info.get("rapid_drop_risk", False)
 
         if hypo:
             return {
@@ -469,6 +488,17 @@ class ActivityEngine:
                 "clinical_alert": "🚨 HYPOGLYCEMIA RISK — Consume fast-acting carbs now",
                 "evidence":       "Exercise contraindicated below 70 mg/dL",
                 "urgency_score":  1.0
+            }
+        elif rapid_drop:
+            return {
+                "activity":       "Seated Rest / Light Stretching",
+                "duration":       "15-20 minutes",
+                "timing":         "Monitor glucose every 15 min",
+                "intensity":      "Very Low",
+                "calorie_burn":   "20-40 kcal",
+                "clinical_alert": "⚠️ RAPID DROP detected — avoid strenuous activity",
+                "evidence":       "Rapid glucose decline may indicate insulin excess or poor absorption",
+                "urgency_score":  0.75
             }
         elif glucose >= 200 or spike > 60:
             return {
@@ -536,19 +566,19 @@ class ClinicalOrchestrator:
         )
         x = sequence[np.newaxis, :, :]
 
-        predictions  = self.prediction_engine.predict_glucose(x)
-        risk_info    = self.prediction_engine.compute_risk(current_glucose, predictions)
-        food_recs    = self.ranking_engine.rank(
+        predictions = self.prediction_engine.predict_glucose(x)
+        risk_info   = self.prediction_engine.compute_risk(current_glucose, predictions)
+        food_recs   = self.ranking_engine.rank(
             self.food_df, risk_info["risk_level"], current_glucose, top_k=top_k
         )
-        meal_plan    = self.ranking_engine.meal_plan(
+        meal_plan   = self.ranking_engine.meal_plan(
             self.food_df, risk_info["risk_level"], current_glucose
         )
-        activity     = self.activity_engine.recommend(risk_info)
+        activity    = self.activity_engine.recommend(risk_info)
 
         return {
-            "timestamp":          datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "risk":               risk_info,
+            "timestamp":            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "risk":                 risk_info,
             "predictions": {
                 "30min":  float(predictions[0]),
                 "60min":  float(predictions[1]),
