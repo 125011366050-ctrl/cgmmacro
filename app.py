@@ -1,6 +1,7 @@
 import streamlit as st
 import numpy as np
 import os
+import pandas as pd
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -12,18 +13,19 @@ def load_system():
     config = Config()
     config.DATA_PATH = BASE_DIR
     config.INPUT_SIZE = 18
+    config.FOOD_FILE = os.path.join(BASE_DIR, "Indian_Foods_GI_GL_Database.xlsx")
     return ClinicalOrchestrator(config)
 
 
-st.set_page_config(page_title="CDSS - Glucose Predictor", layout="wide")
+st.set_page_config(page_title="CDSS — Glucose & Nutrition", layout="wide")
 st.title("🩺 Clinical Decision Support System")
-st.subheader("CGM-Based Glucose Risk Prediction")
+st.caption("CGM-Based Glucose Prediction + Personalised Food & Activity Recommendations")
 
 try:
     system = load_system()
-    st.success("Models loaded successfully!")
+    st.success("✅ System loaded successfully")
 except Exception as e:
-    st.error(f"Model loading failed: {e}")
+    st.error(f"System failed to load: {e}")
     st.stop()
 
 st.markdown("---")
@@ -32,109 +34,222 @@ st.subheader("📋 Patient Input")
 col_a, col_b = st.columns(2)
 
 with col_a:
-    current_glucose = st.number_input(
-        "Current Blood Glucose (mg/dL)",
-        min_value=50,
-        max_value=400,
-        value=120,
-        step=1
-    )
-    meal_carbs = st.number_input(
-        "Recent Meal Carbs (grams)",
-        min_value=0,
-        max_value=300,
-        value=60,
-        step=5
-    )
-    insulin_dose = st.number_input(
-        "Recent Insulin Dose (units)",
-        min_value=0.0,
-        max_value=50.0,
-        value=0.0,
-        step=0.5
-    )
+    st.markdown("**Meal Information**")
+    meal_carbs = st.number_input("Carbohydrates (g)", 0, 300, 60, 5)
+    meal_protein = st.number_input("Protein (g)", 0, 200, 20, 5)
+    meal_fat = st.number_input("Fat (g)", 0, 200, 10, 5)
 
 with col_b:
-    st.markdown("**Last 10 CGM Readings (mg/dL) — oldest to newest**")
+    st.markdown("**Last 10 CGM Readings — oldest → newest (mg/dL)**")
+    defaults = [105, 108, 110, 112, 115, 117, 118, 119, 120, 120]
     cgm_inputs = []
-    cgm_cols = st.columns(5)
-    defaults = [105, 108, 112, 115, 118, 119, 120, 120, 120, 120]
+    row1 = st.columns(5)
+    row2 = st.columns(5)
     for i in range(10):
-        with cgm_cols[i % 5]:
-            val = st.number_input(
-                f"t-{10 - i}",
-                min_value=50,
-                max_value=400,
-                value=defaults[i],
-                step=1,
-                key=f"cgm_{i}"
+        col = row1[i] if i < 5 else row2[i - 5]
+        with col:
+            v = st.number_input(
+                f"t-{9 - i}", 50, 400, defaults[i], 1, key=f"cgm_{i}"
             )
-            cgm_inputs.append(val)
+            cgm_inputs.append(v)
 
 st.markdown("---")
 
-if st.button("🔍 Run Prediction", use_container_width=True):
-    try:
-        # Build input sequence (1, 30, 18)
-        # Fill window with CGM trend + clinical features
-        window_size = 30
-        n_features = 18
+if st.button("🔍 Run Full Analysis", use_container_width=True):
+    with st.spinner("Running prediction, food ranking, and activity plan..."):
+        try:
+            result = system.run(
+                cgm_readings=cgm_inputs,
+                carbs=meal_carbs,
+                protein=meal_protein,
+                fat=meal_fat,
+                top_k=10
+            )
 
-        sample = np.zeros((1, window_size, n_features), dtype=np.float32)
+            current = float(cgm_inputs[-1])
+            risk = result["risk"]
+            preds = result["predictions"]
+            risk_level = risk["risk_level"]
+            spike = risk["spike"]
+            peak = risk["peak"]
+            trend = risk["trend"]
+            activity = result["activity"]
+            food_recs = result["food_recommendations"]
+            meal_plan = result["meal_plan"]
 
-        # Feature 0: glucose trend (repeat last 10 CGM across 30 steps)
-        cgm_array = np.array(cgm_inputs, dtype=np.float32)
-        trend = np.interp(
-            np.linspace(0, 9, window_size),
-            np.arange(10),
-            cgm_array
-        )
-        sample[0, :, 0] = trend
+            # ── GLUCOSE PREDICTIONS ──────────────────────────────
+            st.markdown("---")
+            st.subheader("📊 Predicted Glucose Levels")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("30 min", f"{preds['30min']:.1f} mg/dL",
+                      delta=f"{preds['30min'] - current:+.1f}")
+            c2.metric("60 min", f"{preds['60min']:.1f} mg/dL",
+                      delta=f"{preds['60min'] - current:+.1f}")
+            c3.metric("90 min", f"{preds['90min']:.1f} mg/dL",
+                      delta=f"{preds['90min'] - current:+.1f}")
 
-        # Feature 1: current glucose repeated
-        sample[0, :, 1] = current_glucose
+            # ── RISK ASSESSMENT ──────────────────────────────────
+            st.markdown("---")
+            st.subheader("⚠️ Risk Assessment")
 
-        # Feature 2: carbs
-        sample[0, :, 2] = meal_carbs
+            r1, r2, r3, r4 = st.columns(4)
+            r1.metric("Current Glucose", f"{current:.0f} mg/dL")
+            r2.metric("Predicted Peak", f"{peak:.0f} mg/dL")
+            r3.metric("Glucose Spike", f"+{spike:.1f} mg/dL")
+            r4.metric("30-min Trend", f"{trend:+.1f} mg/dL")
 
-        # Feature 3: insulin
-        sample[0, :, 3] = insulin_dose
+            if risk_level == "HIGH":
+                st.error(f"🔴 HIGH RISK — Immediate action required")
+                st.warning("⚡ Consider corrective insulin or immediate clinical review.")
+            elif risk_level == "MEDIUM":
+                st.warning(f"🟡 MEDIUM RISK — Monitor closely")
+                st.info("📋 Avoid additional carbohydrates. Light activity recommended.")
+            else:
+                st.success(f"🟢 LOW RISK — Glucose trajectory stable")
+                st.info("✅ Continue normal routine. Maintain regular activity.")
 
-        # Feature 4: glucose delta (rate of change)
-        delta = current_glucose - cgm_inputs[-2] if len(cgm_inputs) >= 2 else 0
-        sample[0, :, 4] = delta
+            # ── CGM SIGNAL SUMMARY ───────────────────────────────
+            st.markdown("---")
+            st.subheader("🔬 CGM Signal Summary")
+            g = np.array(cgm_inputs, dtype=np.float32)
+            cgm_slope = float(np.polyfit(np.arange(10), g, 1)[0])
+            cgm_roc = float((g[-1] - g[-5]) / 5)
+            cgm_cv = float(np.std(g) / (np.mean(g) + 1e-6) * 100)
+            cgm_mean = float(np.mean(g))
 
-        # Features 5-17: zeros (other CGM/clinical signals not collected here)
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Mean Glucose", f"{cgm_mean:.1f} mg/dL")
+            m2.metric("Trend Slope", f"{cgm_slope:+.2f} mg/dL/step")
+            m3.metric("Rate of Change", f"{cgm_roc:+.2f} mg/dL/step")
+            m4.metric("Variability (CV)", f"{cgm_cv:.1f}%")
 
-        result = system.run(current_glucose, sample)
-        preds = result["predictions"]
-        risk = result["risk"]
+            # ── FOOD RECOMMENDATIONS ─────────────────────────────
+            st.markdown("---")
+            st.subheader("🍛 Food Recommendations")
+            st.caption(f"Ranked by safety for **{risk_level}** risk level based on GI, GL, spike estimate, protein & fiber.")
 
-        st.subheader("📊 Predicted Glucose Levels")
-        col1, col2, col3 = st.columns(3)
-        col1.metric("30 min", f"{preds[0]:.1f} mg/dL",
-                    delta=f"{preds[0]-current_glucose:+.1f}")
-        col2.metric("60 min", f"{preds[1]:.1f} mg/dL",
-                    delta=f"{preds[1]-current_glucose:+.1f}")
-        col3.metric("90 min", f"{preds[2]:.1f} mg/dL",
-                    delta=f"{preds[2]-current_glucose:+.1f}")
+            if isinstance(food_recs, pd.DataFrame) and not food_recs.empty:
+                display_cols = ["Rank", "Food_Name", "GI", "GL", "Carbs",
+                                "Protein", "Fiber", "Predicted_Spike",
+                                "Predicted_Peak", "Score", "Recommendation"]
+                show_cols = [c for c in display_cols if c in food_recs.columns]
 
-        st.markdown("---")
-        st.subheader("⚠️ Risk Assessment")
+                def highlight_risk(row):
+                    spike_val = row.get("Predicted_Spike", 0)
+                    if spike_val < 20:
+                        return ["background-color: #d4edda"] * len(row)
+                    elif spike_val < 40:
+                        return ["background-color: #fff3cd"] * len(row)
+                    else:
+                        return ["background-color: #f8d7da"] * len(row)
 
-        risk_level = risk["risk"]
-        spike = risk["spike"]
-        peak = risk["peak"]
+                styled = food_recs[show_cols].style.apply(highlight_risk, axis=1).format({
+                    "GI": "{:.0f}",
+                    "GL": "{:.1f}",
+                    "Carbs": "{:.1f}g",
+                    "Protein": "{:.1f}g",
+                    "Fiber": "{:.1f}g",
+                    "Predicted_Spike": "+{:.1f} mg/dL",
+                    "Predicted_Peak": "{:.0f} mg/dL",
+                    "Score": "{:.3f}"
+                })
+                st.dataframe(styled, use_container_width=True)
+            else:
+                st.info("No food recommendations generated.")
 
-        if risk_level == "HIGH":
-            st.error(f"🔴 HIGH RISK — Peak: {peak:.1f} mg/dL | Spike: +{spike:.1f} mg/dL")
-            st.warning("⚡ Consider corrective insulin or immediate clinical review.")
-        elif risk_level == "MEDIUM":
-            st.warning(f"🟡 MEDIUM RISK — Peak: {peak:.1f} mg/dL | Spike: +{spike:.1f} mg/dL")
-            st.info("📋 Monitor closely. Avoid additional carbohydrates.")
-        else:
-            st.success(f"🟢 LOW RISK — Peak: {peak:.1f} mg/dL | Spike: +{spike:.1f} mg/dL")
-            st.info("✅ Glucose trajectory appears stable.")
+            # ── MEAL PLAN ────────────────────────────────────────
+            st.markdown("---")
+            st.subheader("🍽️ Personalised Meal Plan")
+            st.caption("Top 3 safe choices per meal based on food database and risk level.")
 
-    except Exception as e:
-        st.error(f"Prediction failed: {e}")
+            if meal_plan:
+                tab_names = list(meal_plan.keys())
+                tabs = st.tabs(tab_names)
+                for tab, meal_name in zip(tabs, tab_names):
+                    with tab:
+                        items = meal_plan[meal_name]
+                        if items:
+                            meal_df = pd.DataFrame(items)
+                            fmt = {}
+                            if "GI" in meal_df.columns:
+                                fmt["GI"] = "{:.0f}"
+                            if "GL" in meal_df.columns:
+                                fmt["GL"] = "{:.1f}"
+                            if "Predicted_Spike" in meal_df.columns:
+                                fmt["Predicted_Spike"] = "+{:.1f} mg/dL"
+                            if "Score" in meal_df.columns:
+                                fmt["Score"] = "{:.3f}"
+                            st.dataframe(
+                                meal_df.style.format(fmt),
+                                use_container_width=True
+                            )
+                        else:
+                            st.info(f"No items found for {meal_name}.")
+            else:
+                st.info("No meal plan generated.")
+
+            # ── ACTIVITY ─────────────────────────────────────────
+            st.markdown("---")
+            st.subheader("🏃 Activity Recommendation")
+
+            urgency = activity.get("urgency_score", 0)
+            alert = activity.get("clinical_alert", "")
+            act_name = activity.get("activity", "")
+            duration = activity.get("duration", "")
+            timing = activity.get("timing", "")
+            intensity = activity.get("intensity", "")
+            calories = activity.get("calorie_burn", "")
+            evidence = activity.get("evidence", "")
+
+            if urgency >= 0.8:
+                st.error(f"{alert}")
+            elif urgency >= 0.5:
+                st.warning(f"{alert}")
+            else:
+                st.success(f"{alert}")
+
+            a1, a2, a3, a4 = st.columns(4)
+            a1.metric("Activity", act_name)
+            a2.metric("Duration", duration)
+            a3.metric("Intensity", intensity)
+            a4.metric("Calorie Burn", calories)
+
+            st.info(f"⏰ **Timing:** {timing}")
+            st.caption(f"📚 Evidence: {evidence}")
+
+            # ── CLINICAL SUMMARY ─────────────────────────────────
+            st.markdown("---")
+            st.subheader("📋 Clinical Summary")
+
+            top_food = "N/A"
+            top_gi = "N/A"
+            top_spike = 0.0
+            if isinstance(food_recs, pd.DataFrame) and not food_recs.empty:
+                top_food = food_recs.iloc[0].get("Food_Name", "N/A")
+                top_gi = food_recs.iloc[0].get("GI", "N/A")
+                top_spike = food_recs.iloc[0].get("Predicted_Spike", 0.0)
+
+            urgency_label = (
+                "IMMEDIATE" if risk_level == "HIGH"
+                else "SOON" if risk_level == "MEDIUM"
+                else "ROUTINE"
+            )
+
+            st.code(f"""
+CLINICAL SUMMARY — {result['timestamp']}
+==========================================
+Risk Level       : {risk_level} ({urgency_label})
+Current Glucose  : {current:.0f} mg/dL
+Predicted Peak   : {peak:.0f} mg/dL
+Glucose Spike    : {spike:.1f} mg/dL
+30-min Trend     : {trend:+.1f} mg/dL
+Action Required  : {risk['requires_action']}
+
+Top Food         : {top_food} (GI: {top_gi}, Est. Spike: +{top_spike:.1f} mg/dL)
+Activity         : {act_name} — {duration}
+Alert            : {alert}
+""", language="text")
+
+        except Exception as e:
+            st.error(f"Analysis failed: {e}")
+            st.exception(e)
