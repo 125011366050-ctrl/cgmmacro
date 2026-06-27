@@ -25,7 +25,7 @@ try:
     system = load_system()
     st.success("✅ System loaded successfully")
 except Exception as e:
-    st.error(f"System failed to load: {e}")
+    st.error(f"❌ System failed to load: {e}")
     st.exception(e)
     st.stop()
 
@@ -54,17 +54,15 @@ with col_b:
 
 st.markdown("---")
 
-# debug mode toggle
 debug_mode = st.checkbox("🔧 Debug Mode", value=False)
 
 if st.button("🔍 Run Full Analysis", use_container_width=True):
-    with st.spinner("Running prediction, food ranking, and activity plan..."):
+    with st.spinner("⚙️ Processing CGM data, scaling features, running inference..."):
         try:
             cgm_array = np.array(cgm_inputs, dtype=np.float32)
 
-            # validate input range
             if np.any(cgm_array < 50) or np.any(cgm_array > 400):
-                st.error("CGM values must be between 50 and 400 mg/dL")
+                st.error("❌ CGM values must be between 50 and 400 mg/dL")
                 st.stop()
 
             if debug_mode:
@@ -72,6 +70,7 @@ if st.button("🔍 Run Full Analysis", use_container_width=True):
                 st.write("CGM array:", cgm_array)
                 st.write("Shape:", cgm_array.shape)
                 st.write("Carbs / Protein / Fat:", meal_carbs, meal_protein, meal_fat)
+                st.write("CGM trend:", f"{cgm_array[-1] - cgm_array[0]:+.1f} mg/dL over 10 steps")
 
             result = system.run(
                 cgm_readings=cgm_array,
@@ -97,7 +96,6 @@ if st.button("🔍 Run Full Analysis", use_container_width=True):
                 st.write("Raw predictions:", preds)
                 st.write("Risk info:", risk)
 
-            # ── GLUCOSE PREDICTIONS ──────────────────────────────
             st.markdown("---")
             st.subheader("📊 Predicted Glucose Levels")
             c1, c2, c3 = st.columns(3)
@@ -105,7 +103,6 @@ if st.button("🔍 Run Full Analysis", use_container_width=True):
             c2.metric("60 min", f"{preds['60min']:.1f} mg/dL", delta=f"{preds['60min'] - current:+.1f}")
             c3.metric("90 min", f"{preds['90min']:.1f} mg/dL", delta=f"{preds['90min'] - current:+.1f}")
 
-            # ── RISK ─────────────────────────────────────────────
             st.markdown("---")
             st.subheader("⚠️ Risk Assessment")
             r1, r2, r3, r4 = st.columns(4)
@@ -124,7 +121,6 @@ if st.button("🔍 Run Full Analysis", use_container_width=True):
                 st.success("🟢 LOW RISK — Glucose trajectory stable")
                 st.info("✅ Continue normal routine. Maintain regular activity.")
 
-            # ── CGM SIGNAL SUMMARY ───────────────────────────────
             st.markdown("---")
             st.subheader("🔬 CGM Signal Summary")
             g = np.array(cgm_inputs, dtype=np.float32)
@@ -139,16 +135,14 @@ if st.button("🔍 Run Full Analysis", use_container_width=True):
             m3.metric("Rate of Change", f"{cgm_roc:+.2f} mg/dL/step")
             m4.metric("Variability (CV)", f"{cgm_cv:.1f}%")
 
-            # ── CGM CHART ────────────────────────────────────────
             st.markdown("---")
             st.subheader("📈 CGM Trend")
             chart_data = pd.DataFrame({
                 "Reading": list(range(1, 11)),
                 "Glucose (mg/dL)": cgm_inputs
             }).set_index("Reading")
-            st.line_chart(chart_data)
+            st.line_chart(chart_data, height=300)
 
-            # ── FOOD RECOMMENDATIONS ─────────────────────────────
             st.markdown("---")
             st.subheader("🍛 Food Recommendations")
             st.caption(
@@ -180,11 +174,10 @@ if st.button("🔍 Run Full Analysis", use_container_width=True):
                 if "Score" in food_recs.columns: fmt["Score"] = "{:.3f}"
 
                 styled = food_recs[show_cols].style.apply(highlight_spike, axis=1).format(fmt)
-                st.dataframe(styled, use_container_width=True)
+                st.dataframe(styled, use_container_width=True, height=400)
             else:
                 st.info("No food recommendations generated.")
 
-            # ── MEAL PLAN ────────────────────────────────────────
             st.markdown("---")
             st.subheader("🍽️ Personalised Meal Plan")
             st.caption("Top 3 safe choices per meal from your food database.")
@@ -201,13 +194,12 @@ if st.button("🔍 Run Full Analysis", use_container_width=True):
                             if "GL" in mdf.columns: mfmt["GL"] = "{:.1f}"
                             if "Predicted_Spike" in mdf.columns: mfmt["Predicted_Spike"] = "+{:.1f} mg/dL"
                             if "Score" in mdf.columns: mfmt["Score"] = "{:.3f}"
-                            st.dataframe(mdf.style.format(mfmt), use_container_width=True)
+                            st.dataframe(mdf.style.format(mfmt), use_container_width=True, height=300)
                         else:
                             st.info(f"No items found for {meal_name}.")
             else:
                 st.info("No meal plan generated.")
 
-            # ── ACTIVITY ─────────────────────────────────────────
             st.markdown("---")
             st.subheader("🏃 Activity Recommendation")
 
@@ -236,7 +228,6 @@ if st.button("🔍 Run Full Analysis", use_container_width=True):
             st.info(f"⏰ **Timing:** {timing}")
             st.caption(f"📚 Evidence: {evidence}")
 
-            # ── CLINICAL SUMMARY ─────────────────────────────────
             st.markdown("---")
             st.subheader("📋 Clinical Summary")
 
@@ -264,5 +255,5 @@ Alert            : {alert}
 """, language="text")
 
         except Exception as e:
-            st.error(f"Analysis failed: {e}")
+            st.error(f"❌ Analysis failed: {e}")
             st.exception(e)
