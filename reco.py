@@ -64,7 +64,6 @@ def build_cgm_features(g: np.ndarray, carbs=0, protein=0, fat=0) -> np.ndarray:
 
 def build_lstm_input(cgm_readings, carbs=0, protein=0, fat=0, window_size=30) -> np.ndarray:
     cgm = np.array(cgm_readings, dtype=np.float32)
-    # pad if too short — never crash on short input
     if len(cgm) < 10:
         cgm = np.pad(cgm, (10 - len(cgm), 0), mode='edge')
     cgm_interp = np.interp(
@@ -136,12 +135,20 @@ class PredictionEngine:
     def load_models(self):
         base = self.config.DATA_PATH
 
+        feature_scaler_path = os.path.join(base, "feature_scaler.pkl")
+        if os.path.exists(feature_scaler_path):
+            self.feature_scaler = joblib.load(feature_scaler_path)
+            print("✓ Feature scaler loaded")
+        else:
+            print("⚠️ Feature scaler not found — using raw features (may degrade performance)")
+            self.feature_scaler = None
+
         scaler_path = os.path.join(base, "glucose_scaler.pkl")
         if not os.path.exists(scaler_path):
             raise FileNotFoundError(f"Missing scaler: {scaler_path}")
         self.scaler = joblib.load(scaler_path)
         self.scaler_mode = _probe_scaler(self.scaler, self.config.N_HORIZONS)
-        print(f"Scaler loaded — mode detected: {self.scaler_mode}")
+        print(f"✓ Glucose scaler loaded — mode: {self.scaler_mode}")
 
         self.lstm = LSTMEncoder(
             input_size=self.config.INPUT_SIZE,
@@ -156,74 +163,71 @@ class PredictionEngine:
             torch.load(lstm_path, map_location=self.device), strict=True
         )
         self.lstm.eval()
-        print("LSTM loaded")
+        print("✓ LSTM loaded")
 
         tabnet_path = os.path.join(base, "tabnet_on_learned_embeddings.zip")
         if not os.path.exists(tabnet_path):
             raise FileNotFoundError(f"Missing TabNet: {tabnet_path}")
         self.tabnet = TabNetRegressor()
         self.tabnet.load_model(tabnet_path)
-        print("TabNet loaded")
+        print("✓ TabNet loaded")
+
+    def _scale_features(self, x: np.ndarray) -> np.ndarray:
+        """Scale input features using the feature scaler (crucial!)"""
+        if self.feature_scaler is None:
+            return x
+        
+        original_shape = x.shape
+        x_flat = x.reshape(-1, x.shape[-1])
+        x_scaled = self.feature_scaler.transform(x_flat)
+        return x_scaled.reshape(original_shape)
 
     def _inverse_scale(self, raw: np.ndarray) -> np.ndarray:
         raw = raw.flatten()
         if self.scaler_mode == 'multi':
             inp = raw.reshape(1, -1)
             pred = self.scaler.inverse_transform(inp).flatten()
-            print(f"Inverse transform (multi): {raw} → {pred}")
             return pred
         if self.scaler_mode == 'single':
             pred = np.array([
                 self.scaler.inverse_transform([[v]])[0][0] for v in raw
             ])
-            print(f"Inverse transform (single loop): {raw} → {pred}")
             return pred
-        print("WARNING: scaler unusable — returning raw output as-is")
         return raw
 
     def predict_glucose(self, x: np.ndarray) -> np.ndarray:
         if len(x.shape) == 2:
             x = x[np.newaxis, :, :]
         x = x.astype(np.float32)
+        
+        # 🔥 CRITICAL: Scale features before model
+        x = self._scale_features(x)
+        
         t = torch.from_numpy(x).float().to(self.device)
 
         with torch.no_grad():
             emb = self.lstm.get_embedding(t).cpu().numpy().astype(np.float32)
 
-        # always safe shape for TabNet
         emb = emb.reshape(emb.shape[0], -1)
-        print(f"Embedding — shape: {emb.shape} | min: {emb.min():.4f} | max: {emb.max():.4f} | mean: {emb.mean():.4f} | std: {emb.std():.4f}")
-
-        # warn if embedding looks wrong
-        if emb.max() > 100 or (emb.std() < 1e-4):
-            print("WARNING: embedding range looks abnormal — possible model mismatch")
+        print(f"Embedding shape: {emb.shape} | range: [{emb.min():.4f}, {emb.max():.4f}]")
 
         raw = self.tabnet.predict(emb)
         raw = np.array(raw, dtype=np.float32)
         if raw.ndim == 1:
             raw = raw.reshape(1, -1)
         raw = raw.flatten()
-        print(f"TabNet raw output: {raw}")
 
-        # safe heuristic: glucose is always 50-400 mg/dL
-        # if max < 5  → definitely scaled down  → inverse transform
-        # if max > 1000 → definitely wrong scale → inverse transform
-        # otherwise → already in glucose range → use directly
         if raw.max() < 5 or raw.max() > 1000:
-            print("Detected scaled/abnormal output → applying inverse transform")
             pred = self._inverse_scale(raw)
         else:
-            print("Detected glucose-range output → using raw directly")
             pred = raw
 
-        # if only 1 value returned (TabNet trained as single-output), extrapolate
         if len(pred) == 1:
-            print("WARNING: single value returned — extrapolating to 3 horizons")
             base_val = float(pred[0])
             pred = np.array([base_val, base_val * 1.01, base_val * 1.02], dtype=np.float32)
 
         pred = np.clip(pred[:3], 50, 400)
-        print(f"Final predictions (30/60/90 min): {pred}")
+        print(f"Predictions (30/60/90 min): {pred}")
         return pred
 
     def compute_risk(self, current: float, predictions: np.ndarray) -> Dict:
@@ -253,7 +257,7 @@ def load_food_database(food_file: str) -> pd.DataFrame:
     for sheet in ["GI & Nutrition Data", "Sheet1", 0]:
         try:
             df = pd.read_excel(food_file, sheet_name=sheet)
-            print(f"Food DB loaded — sheet: {sheet} | rows: {len(df)}")
+            print(f"✓ Food DB loaded — sheet: {sheet} | rows: {len(df)}")
             break
         except Exception:
             continue
@@ -289,7 +293,7 @@ def load_food_database(food_file: str) -> pd.DataFrame:
         df[col] = df[col].fillna(default)
     for col in ["GI", "GL", "Carbs", "Protein", "Fat", "Calories", "Fiber"]:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-    print(f"Food DB ready | GI range: {df['GI'].min():.0f}–{df['GI'].max():.0f}")
+    print(f"✓ Food DB ready | GI range: {df['GI'].min():.0f}–{df['GI'].max():.0f}")
     return df
 
 
@@ -444,7 +448,7 @@ class ClinicalOrchestrator:
         self.food_df = load_food_database(config.FOOD_FILE)
         self.ranking_engine = FoodRankingEngine()
         self.activity_engine = ActivityEngine()
-        print("CDSS ready.")
+        print("✓ CDSS ready")
 
     def run(self, cgm_readings, carbs=0, protein=0, fat=0, top_k=10) -> Dict:
         cgm_readings = list(cgm_readings)
