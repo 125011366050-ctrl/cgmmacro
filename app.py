@@ -1,77 +1,70 @@
 import streamlit as st
 import numpy as np
-import pandas as pd
+import os
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 from reco import ClinicalOrchestrator, Config
 
-st.set_page_config(page_title="CDSS AI System", page_icon="🩸")
-
-st.title("🩸 Diabetes CDSS Recommendation System")
 
 @st.cache_resource
 def load_system():
     config = Config()
-    system = ClinicalOrchestrator(config)
-    return system
+    config.DATA_PATH = BASE_DIR
+    return ClinicalOrchestrator(config)
 
-system = load_system()
 
-st.header("Patient Input")
+st.set_page_config(page_title="CDSS - Glucose Predictor", layout="centered")
+st.title("🩺 Clinical Decision Support System")
+st.subheader("Glucose Risk Prediction")
 
-glucose = st.number_input("Current Glucose", 40.0, 400.0, 120.0)
-heart_rate = st.number_input("Heart Rate", 40.0, 180.0, 80.0)
-calories = st.number_input("Calories", 0.0, 2000.0, 250.0)
-carbs = st.number_input("Carbs", 0.0, 300.0, 40.0)
-protein = st.number_input("Protein", 0.0, 200.0, 20.0)
-fat = st.number_input("Fat", 0.0, 200.0, 10.0)
-fiber = st.number_input("Fiber", 0.0, 100.0, 5.0)
+try:
+    system = load_system()
+    st.success("Models loaded successfully!")
+except Exception as e:
+    st.error(f"Model loading failed: {e}")
+    st.stop()
 
-meal_flag = 1
+st.markdown("---")
+current_glucose = st.number_input(
+    "Enter Current Blood Glucose (mg/dL)",
+    min_value=50,
+    max_value=400,
+    value=120,
+    step=1
+)
 
-# dummy window (IMPORTANT)
-def create_window(glucose):
-    window_size = 36
-    features = 18
-    base = np.zeros((window_size, features), dtype=np.float32)
+if st.button("Run Prediction"):
+    try:
+        X_test = np.load(os.path.join(BASE_DIR, "X_test.npy"))
+        sample = X_test[0:1]
 
-    base[:, 0] = glucose  # GL
-    base[:, 7] = heart_rate
-    base[:, 10] = calories
-    base[:, 11] = carbs
-    base[:, 12] = protein
-    base[:, 13] = fat
-    base[:, 14] = fiber
-    base[:, 9] = meal_flag
+        result = system.run(current_glucose, sample)
 
-    return base
+        preds = result["predictions"]
+        risk = result["risk"]
 
-if st.button("Predict & Recommend"):
+        st.markdown("---")
+        st.subheader("📊 Prediction Results")
 
-    x_window = create_window(glucose)
+        col1, col2, col3 = st.columns(3)
+        col1.metric("30-min Glucose", f"{preds[0]:.1f} mg/dL")
+        col2.metric("60-min Glucose", f"{preds[1]:.1f} mg/dL")
+        col3.metric("90-min Glucose", f"{preds[2]:.1f} mg/dL")
 
-    result = system.run(
-        current_glucose=glucose,
-        x_window=x_window,
-        top_k=5
-    )
+        st.markdown("---")
+        st.subheader("⚠️ Risk Assessment")
 
-    st.subheader("📊 Risk Analysis")
-    st.write(result["risk"])
+        risk_level = risk["risk"]
+        spike = risk["spike"]
+        peak = risk["peak"]
 
-    st.subheader("📈 Predictions")
-    st.write(result["predictions"])
+        if risk_level == "HIGH":
+            st.error(f"🔴 Risk Level: HIGH | Peak: {peak:.1f} mg/dL | Spike: +{spike:.1f}")
+        elif risk_level == "MEDIUM":
+            st.warning(f"🟡 Risk Level: MEDIUM | Peak: {peak:.1f} mg/dL | Spike: +{spike:.1f}")
+        else:
+            st.success(f"🟢 Risk Level: LOW | Peak: {peak:.1f} mg/dL | Spike: +{spike:.1f}")
 
-    st.subheader("🏃 Activity Recommendation")
-    st.write(result["activity"])
-
-    st.subheader("🍛 Food Recommendations")
-
-    df = pd.DataFrame(result["food_recommendations"])
-    if not df.empty:
-        st.dataframe(df)
-    else:
-        st.warning("No food recommendations available")
-
-    st.subheader("🍽️ Meal Plan")
-    st.json(result["meal_plan"])
-
-    st.success("Prediction completed")
+    except Exception as e:
+        st.error(f"Prediction failed: {e}")
