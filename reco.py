@@ -77,7 +77,7 @@ def build_lstm_input(cgm_readings, carbs=0, protein=0, fat=0, window_size=36) ->
         features = build_cgm_features(window, carbs=carbs, protein=protein, fat=fat)
         sequence.append(features)
     seq = np.array(sequence, dtype=np.float32)
-    assert seq.shape == (window_size, 18), f"Sequence shape mismatch: {seq.shape}, expected ({window_size}, 18)"
+    assert seq.shape == (window_size, 18), f"Sequence shape mismatch: {seq.shape}"
     return seq
 
 class LSTMEncoder(nn.Module):
@@ -134,7 +134,7 @@ class PredictionEngine:
 
         feature_scaler_path = os.path.join(base, "feature_scaler.pkl")
         if not os.path.exists(feature_scaler_path):
-            raise FileNotFoundError(f"❌ CRITICAL: Feature scaler missing at {feature_scaler_path}")
+            raise FileNotFoundError(f"Feature scaler missing: {feature_scaler_path}")
         self.feature_scaler = joblib.load(feature_scaler_path)
         print("✓ Feature scaler loaded")
 
@@ -159,8 +159,6 @@ class PredictionEngine:
             strict=False
         )
         self.lstm.eval()
-        
-        # CRITICAL FIX: Freeze LSTM
         for param in self.lstm.parameters():
             param.requires_grad = False
         print("✓ LSTM loaded and frozen")
@@ -172,18 +170,17 @@ class PredictionEngine:
         self.tabnet.load_model(tabnet_path)
         print("✓ TabNet loaded")
 
-        # Load embedding scaler
         embedding_scaler_path = os.path.join(base, "embedding_scaler.pkl")
         if os.path.exists(embedding_scaler_path):
             self.embedding_scaler = joblib.load(embedding_scaler_path)
             print("✓ Embedding scaler loaded")
         else:
-            print("⚠️ No embedding scaler found - using identity")
             self.embedding_scaler = None
+            print("⚠️ No embedding scaler — using z-norm fallback")
 
     def _scale_features(self, x: np.ndarray) -> np.ndarray:
         if self.feature_scaler is None:
-            raise ValueError("❌ Feature scaler missing!")
+            raise ValueError("Feature scaler missing!")
         original_shape = x.shape
         x_flat = x.reshape(-1, x.shape[-1])
         x_scaled = self.feature_scaler.transform(x_flat)
@@ -192,20 +189,26 @@ class PredictionEngine:
 
     def _inverse_scale(self, raw: np.ndarray) -> np.ndarray:
         raw = np.array(raw, dtype=np.float32).reshape(-1)
-        if self.scaler_mode == 'multi':
-            return self.scaler.inverse_transform(raw.reshape(1, -1)).flatten()
-        elif self.scaler_mode == 'single':
-            return np.array([
-                self.scaler.inverse_transform([[v]])[0][0] for v in raw
-            ])
-        else:
-            return raw
+        try:
+            if self.scaler_mode == 'multi':
+                result = self.scaler.inverse_transform(raw.reshape(1, -1)).flatten()
+            elif self.scaler_mode == 'single':
+                result = np.array([
+                    self.scaler.inverse_transform([[v]])[0][0] for v in raw
+                ])
+            else:
+                result = raw.copy()
+            result = np.nan_to_num(result, nan=120.0, posinf=400.0, neginf=40.0)
+            return result
+        except Exception as e:
+            print(f"⚠️ inverse_scale failed: {e} — returning raw")
+            return raw.copy()
 
     def predict_glucose(self, x: np.ndarray) -> np.ndarray:
         if len(x.shape) == 2:
             x = x[np.newaxis, :, :]
         x = x.astype(np.float32)
-        
+
         x = self._scale_features(x)
         t = torch.from_numpy(x).float().to(self.device)
 
@@ -213,28 +216,29 @@ class PredictionEngine:
             emb = self.lstm.get_embedding(t).cpu().numpy().astype(np.float32)
 
         emb = emb.reshape(emb.shape[0], -1)
-        
-        # CRITICAL FIX: Use embedding scaler if available
+        print(f"[DEBUG] EMB shape: {emb.shape} | mean: {emb.mean():.4f} | std: {emb.std():.4f}")
+
         if self.embedding_scaler is not None:
             emb = self.embedding_scaler.transform(emb)
         else:
-            # Fallback normalization
             emb = (emb - np.mean(emb, axis=0)) / (np.std(emb, axis=0) + 1e-6)
-        
+
         emb = np.nan_to_num(emb, nan=0.0, posinf=0.0, neginf=0.0)
 
         raw = self.tabnet.predict(emb)
         raw = np.array(raw, dtype=np.float32).flatten()
+        print(f"[DEBUG] RAW TabNet output: {raw}")
 
-        # Physiological clamp
-        raw = np.clip(raw, 50, 250)
-        
+        raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
+
         pred = self._inverse_scale(raw)
+        print(f"[DEBUG] After inverse_scale: {pred}")
+
         pred = np.clip(pred, 40, 400)
 
         if len(pred) == 1:
             base_val = float(pred[0])
-            pred = np.array([base_val, base_val * 1.01, base_val * 1.02], dtype=np.float32)
+            pred = np.array([base_val, base_val, base_val], dtype=np.float32)
 
         return pred
 
