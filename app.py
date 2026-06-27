@@ -61,7 +61,7 @@ st.markdown("---")
 debug_mode = st.checkbox("🔧 Debug Mode", value=False)
 
 if st.button("🔍 Run Full Analysis", use_container_width=True):
-    with st.spinner("⚙️ Scaling features → LSTM → Embedding normalization → TabNet → Output..."):
+    with st.spinner("⚙️ Scaling → Removing NaNs → LSTM → Normalize Embedding → TabNet → Predict..."):
         try:
             cgm_array = np.array(cgm_inputs, dtype=np.float32)
 
@@ -72,9 +72,8 @@ if st.button("🔍 Run Full Analysis", use_container_width=True):
             if debug_mode:
                 st.markdown("### 🔧 Debug — Raw Input")
                 st.write("CGM array:", cgm_array)
-                st.write("Shape:", cgm_array.shape)
-                st.write("Carbs / Protein / Fat:", meal_carbs, meal_protein, meal_fat)
                 st.write("CGM trend:", f"{cgm_array[-1] - cgm_array[0]:+.1f} mg/dL")
+                st.write("Carbs / Protein / Fat:", meal_carbs, meal_protein, meal_fat)
 
             result = system.run(
                 cgm_readings=cgm_array,
@@ -98,7 +97,7 @@ if st.button("🔍 Run Full Analysis", use_container_width=True):
             if debug_mode:
                 st.markdown("### 🔧 Debug — Model Output")
                 st.write("Predictions:", preds)
-                st.write("Risk info:", risk)
+                st.write("Risk:", risk)
 
             st.markdown("---")
             st.subheader("📊 Predicted Glucose Levels")
@@ -149,17 +148,10 @@ if st.button("🔍 Run Full Analysis", use_container_width=True):
 
             st.markdown("---")
             st.subheader("🍛 Food Recommendations")
-            st.caption(
-                f"Ranked by safety for **{risk_level}** risk — "
-                f"scored on GI, GL, estimated spike, protein & fiber."
-            )
+            st.caption(f"Ranked by safety for **{risk_level}** risk")
 
             if isinstance(food_recs, pd.DataFrame) and not food_recs.empty:
-                display_cols = [
-                    "Rank", "Food_Name", "GI", "GL", "Carbs",
-                    "Protein", "Fiber", "Predicted_Spike",
-                    "Predicted_Peak", "Score", "Recommendation"
-                ]
+                display_cols = ["Rank", "Food_Name", "GI", "GL", "Carbs", "Protein", "Fiber", "Predicted_Spike", "Predicted_Peak", "Score", "Recommendation"]
                 show_cols = [c for c in display_cols if c in food_recs.columns]
 
                 def highlight_spike(row):
@@ -173,18 +165,18 @@ if st.button("🔍 Run Full Analysis", use_container_width=True):
                 if "Carbs" in food_recs.columns: fmt["Carbs"] = "{:.1f}g"
                 if "Protein" in food_recs.columns: fmt["Protein"] = "{:.1f}g"
                 if "Fiber" in food_recs.columns: fmt["Fiber"] = "{:.1f}g"
-                if "Predicted_Spike" in food_recs.columns: fmt["Predicted_Spike"] = "+{:.1f} mg/dL"
-                if "Predicted_Peak" in food_recs.columns: fmt["Predicted_Peak"] = "{:.0f} mg/dL"
+                if "Predicted_Spike" in food_recs.columns: fmt["Predicted_Spike"] = "+{:.1f}"
+                if "Predicted_Peak" in food_recs.columns: fmt["Predicted_Peak"] = "{:.0f}"
                 if "Score" in food_recs.columns: fmt["Score"] = "{:.3f}"
 
                 styled = food_recs[show_cols].style.apply(highlight_spike, axis=1).format(fmt)
                 st.dataframe(styled, use_container_width=True, height=400)
             else:
-                st.info("No food recommendations generated.")
+                st.info("No recommendations")
 
             st.markdown("---")
             st.subheader("🍽️ Personalised Meal Plan")
-            st.caption("Top 3 safe choices per meal from your food database.")
+            st.caption("Top 3 choices per meal")
 
             if meal_plan:
                 tabs = st.tabs(list(meal_plan.keys()))
@@ -196,13 +188,11 @@ if st.button("🔍 Run Full Analysis", use_container_width=True):
                             mfmt = {}
                             if "GI" in mdf.columns: mfmt["GI"] = "{:.0f}"
                             if "GL" in mdf.columns: mfmt["GL"] = "{:.1f}"
-                            if "Predicted_Spike" in mdf.columns: mfmt["Predicted_Spike"] = "+{:.1f} mg/dL"
+                            if "Predicted_Spike" in mdf.columns: mfmt["Predicted_Spike"] = "+{:.1f}"
                             if "Score" in mdf.columns: mfmt["Score"] = "{:.3f}"
-                            st.dataframe(mdf.style.format(mfmt), use_container_width=True, height=300)
+                            st.dataframe(mdf.style.format(mfmt), use_container_width=True)
                         else:
-                            st.info(f"No items found for {meal_name}.")
-            else:
-                st.info("No meal plan generated.")
+                            st.info(f"No items for {meal_name}")
 
             st.markdown("---")
             st.subheader("🏃 Activity Recommendation")
@@ -227,10 +217,10 @@ if st.button("🔍 Run Full Analysis", use_container_width=True):
             a1.metric("Activity", act_name)
             a2.metric("Duration", duration)
             a3.metric("Intensity", intensity)
-            a4.metric("Calorie Burn", calories)
+            a4.metric("Calories", calories)
 
             st.info(f"⏰ **Timing:** {timing}")
-            st.caption(f"📚 Evidence: {evidence}")
+            st.caption(f"📚 {evidence}")
 
             st.markdown("---")
             st.subheader("📋 Clinical Summary")
@@ -243,8 +233,7 @@ if st.button("🔍 Run Full Analysis", use_container_width=True):
 
             urgency_label = "IMMEDIATE" if risk_level == "HIGH" else "SOON" if risk_level == "MEDIUM" else "ROUTINE"
 
-            st.code(f"""
-CLINICAL SUMMARY — {result['timestamp']}
+            st.code(f"""CLINICAL SUMMARY — {result['timestamp']}
 ==========================================
 Risk Level       : {risk_level} ({urgency_label})
 Current Glucose  : {current:.0f} mg/dL
@@ -253,10 +242,9 @@ Glucose Spike    : {spike:.1f} mg/dL
 30-min Trend     : {trend:+.1f} mg/dL
 Action Required  : {risk['requires_action']}
 
-Top Food         : {top_food} (GI: {top_gi}, Est. Spike: +{top_spike:.1f} mg/dL)
+Top Food         : {top_food} (GI: {top_gi}, Spike: +{top_spike:.1f})
 Activity         : {act_name} — {duration}
-Alert            : {alert}
-""", language="text")
+Alert            : {alert}""", language="text")
 
         except Exception as e:
             st.error(f"❌ Analysis failed: {e}")
