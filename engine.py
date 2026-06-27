@@ -49,26 +49,17 @@ class Config:
 # ─────────────────────────────────────────────────────────────
 #  REMOTE MODEL DOWNLOAD (Google Drive fallback)
 # ─────────────────────────────────────────────────────────────
-# Fill in your real Google Drive file IDs below.
-# To get a file ID: share the file on Drive -> "Anyone with link" ->
-# the ID is the long string in the URL between /d/ and /view
-#   https://drive.google.com/file/d/FILE_ID_HERE/view
-
 REMOTE_FILES = {
     "feature_scaler.pkl":                  "PUT_FEATURE_SCALER_FILE_ID_HERE",
     "glucose_scaler.pkl":                  "PUT_GLUCOSE_SCALER_FILE_ID_HERE",
-    "lstm_encoder_trained.pth":             "PUT_LSTM_FILE_ID_HERE",
-    "tabnet_on_learned_embeddings.zip":     "PUT_TABNET_FILE_ID_HERE",
-    "embedding_scaler.pkl":                 "PUT_EMBEDDING_SCALER_FILE_ID_HERE",  # optional
+    "lstm_encoder_trained.pth":            "PUT_LSTM_FILE_ID_HERE",
+    "tabnet_on_learned_embeddings.zip":    "PUT_TABNET_FILE_ID_HERE",
+    "embedding_scaler.pkl":                "PUT_EMBEDDING_SCALER_FILE_ID_HERE",
     "Indian_Foods_GI_GL_Database (1).xlsx": "PUT_FOOD_DB_FILE_ID_HERE",
 }
 
 
 def ensure_file(filename: str, base_dir: str, required: bool = True) -> str:
-    """
-    Returns the local path to `filename` inside base_dir.
-    If missing locally and a Drive ID is configured, downloads it first.
-    """
     local_path = os.path.join(base_dir, filename)
     if os.path.exists(local_path):
         return local_path
@@ -86,7 +77,7 @@ def ensure_file(filename: str, base_dir: str, required: bool = True) -> str:
             )
         else:
             print(f"⚠️ Optional file '{filename}' not found and not configured — skipping.")
-            return local_path  # caller is expected to check os.path.exists again
+            return local_path
 
     try:
         import gdown
@@ -571,6 +562,9 @@ def load_food_database(food_file: str) -> pd.DataFrame:
 
 
 class FoodRankingEngine:
+    def __init__(self):
+        pass
+
     def _normalize(self, x: np.ndarray) -> np.ndarray:
         mn, mx = x.min(), x.max()
         return (x - mn) / (mx - mn + 1e-8) if mx > mn else np.ones_like(x) * 0.5
@@ -683,6 +677,9 @@ class FoodRankingEngine:
 
 
 class ActivityEngine:
+    def __init__(self):
+        pass
+
     def recommend(self, risk_info: Dict) -> Dict:
         r = safe_risk(risk_info)
         risk       = r["risk_level"]
