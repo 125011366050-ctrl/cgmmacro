@@ -91,7 +91,7 @@ class PredictionEngine:
 
     def load_models(self):
         # Load scaler - ensure it's 1D
-        self.scaler = joblib.load(os.path.join(self.config.DATA_PATH, 'glucose_scaler.pkl'))
+        self.DATA_PATH = self.BASE_DIR
         
         # Handle both old and new scaler formats
         if hasattr(self.scaler, 'n_features_in_'):
