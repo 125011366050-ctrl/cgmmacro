@@ -35,7 +35,10 @@ class Config:
     MAX_DROP_PER_STEP: float = 40.0
     MAX_RISE_PER_STEP: float = 60.0
     PHYSIO_NOISE_STD: float = 3.0
-    RAPID_DROP_THRESHOLD: float = 40.0
+    # Graded drop thresholds (mg/dL over prediction window)
+    DROP_HIGH_ALERT: float = 70.0
+    DROP_MODERATE_ALERT: float = 50.0
+    DROP_CAUTION: float = 35.0
 
 def build_cgm_features(g: np.ndarray, carbs=0, protein=0, fat=0) -> np.ndarray:
     g = np.array(g, dtype=np.float32)
@@ -212,7 +215,6 @@ class PredictionEngine:
         max_rise = self.config.MAX_RISE_PER_STEP
         pred = pred.copy().astype(np.float32)
 
-        # Physiological bounds relative to current, then step-by-step
         pred[0] = np.clip(pred[0], current - max_drop, current + max_rise)
         for i in range(1, len(pred)):
             pred[i] = np.clip(pred[i], pred[i-1] - max_drop, pred[i-1] + max_rise)
@@ -230,12 +232,32 @@ class PredictionEngine:
 
         return pred
 
+    def _enforce_physiological_curve(self, pred: np.ndarray, current: float) -> np.ndarray:
+        """
+        Enforce realistic 30/60/120 min curve shape.
+        Base prediction = 30 min.
+        60 min and 120 min are shaped by the trend direction,
+        not left as independent raw outputs (which causes inversions).
+        """
+        p30 = float(pred[0])
+        delta = p30 - current  # direction: positive = rising, negative = falling
+
+        if delta > 0:
+            # Rising pattern: peak around 60 min, slight decay at 120 min
+            p60  = p30 + delta * 0.4
+            p120 = p30 + delta * 0.1
+        else:
+            # Falling pattern: gradual continuation, slowing toward 120 min
+            p60  = p30 + delta * 0.6
+            p120 = p30 + delta * 0.3
+
+        return np.array([p30, p60, p120], dtype=np.float32)
+
     def predict_glucose(self, x: np.ndarray) -> np.ndarray:
         if len(x.shape) == 2:
             x = x[np.newaxis, :, :]
         x = x.astype(np.float32)
 
-        # Capture current glucose from raw input BEFORE scaling
         current_glucose = float(x[0, -1, 0])
 
         x_scaled = self._scale_features(x)
@@ -265,14 +287,18 @@ class PredictionEngine:
         pred = self._inverse_scale(raw)
         print(f"[DEBUG] After inverse_scale: {pred}")
 
-        # Physiological clip relative to current — not hard 40/400
+        # Anchor to current glucose range — not hard global clip
         pred = np.clip(pred, current_glucose - 80, current_glucose + 120)
 
         if len(pred) == 1:
             base_val = float(pred[0])
             pred = np.array([base_val, base_val, base_val], dtype=np.float32)
 
+        # Step 1: physiological step clamp + noise
         pred = self._apply_physiology_clamp(pred, current_glucose)
+
+        # Step 2: enforce realistic 30/60/120 curve shape
+        pred = self._enforce_physiological_curve(pred, current_glucose)
 
         # Final safety clip
         pred = np.clip(pred, 40, 400)
@@ -280,50 +306,53 @@ class PredictionEngine:
 
         return pred
 
+    def _classify_drop(self, drop: float) -> str:
+        """Graded drop severity — avoids over-alerting on mild declines."""
+        if drop >= self.config.DROP_HIGH_ALERT:
+            return "HIGH_ALERT"
+        elif drop >= self.config.DROP_MODERATE_ALERT:
+            return "MODERATE_ALERT"
+        elif drop >= self.config.DROP_CAUTION:
+            return "CAUTION"
+        else:
+            return "NORMAL"
+
     def compute_risk(self, current: float, predictions: np.ndarray) -> Dict:
         peak   = float(np.max(predictions))
         trough = float(np.min(predictions))
 
-        # Upward spike — how much glucose will rise
-        upward_spike = max(0.0, peak - current)
+        # Both directions tracked separately and shown in UI
+        upward_spike   = max(0.0, peak - current)
+        downward_drop  = max(0.0, current - trough)
 
-        # Downward drop — how much glucose will fall
-        downward_drop = max(0.0, current - trough)
+        drop_severity  = self._classify_drop(downward_drop)
+        trend          = float(predictions[0] - current)
+        hypo_risk      = trough < 70.0
 
-        # Clinical spike = whichever direction is more dangerous
-        spike = upward_spike
-
-        trend = float(predictions[0] - current)
-
-        # Hypoglycemia risk
-        hypo_risk = trough < 70.0
-
-        # Rapid drop risk — dangerous even without hypo
-        rapid_drop_risk = downward_drop > self.config.RAPID_DROP_THRESHOLD
-
+        # Risk classification — graded, not binary
         if (current >= self.config.CRITICAL_GLUCOSE
                 or upward_spike >= self.config.MEDIUM_SPIKE
-                or hypo_risk):
+                or hypo_risk
+                or drop_severity == "HIGH_ALERT"):
             risk_level = "HIGH"
         elif (current >= self.config.WARNING_GLUCOSE
                 or upward_spike >= self.config.LOW_SPIKE
-                or rapid_drop_risk):
+                or drop_severity in ("MODERATE_ALERT", "CAUTION")):
             risk_level = "MEDIUM"
         else:
             risk_level = "LOW"
 
         return {
-            "risk_level":      risk_level,
-            "spike":           spike,
-            "upward_spike":    upward_spike,
-            "downward_drop":   downward_drop,
-            "trend":           trend,
-            "peak":            peak,
-            "trough":          trough,
-            "current":         float(current),
-            "hypo_risk":       hypo_risk,
-            "rapid_drop_risk": rapid_drop_risk,
-            "predictions":     predictions.tolist(),
+            "risk_level":     risk_level,
+            "upward_spike":   upward_spike,
+            "downward_drop":  downward_drop,
+            "drop_severity":  drop_severity,
+            "trend":          trend,
+            "peak":           peak,
+            "trough":         trough,
+            "current":        float(current),
+            "hypo_risk":      hypo_risk,
+            "predictions":    predictions.tolist(),
             "requires_action": risk_level in ["MEDIUM", "HIGH"]
         }
 
@@ -368,10 +397,11 @@ def load_food_database(food_file: str) -> pd.DataFrame:
     for col in ["GI", "GL", "Carbs", "Protein", "Fat", "Calories", "Fiber"]:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-    # Replace zero GI with median — zero means missing data, not truly zero GI
-    median_gi = df[df["GI"] > 0]["GI"].median()
-    df.loc[df["GI"] == 0, "GI"] = median_gi
-    print(f"✓ Food DB ready | GI range: {df['GI'].min():.0f}–{df['GI'].max():.0f}")
+    # Replace zero/missing GI with median — zero means missing data
+    df["GI"] = df["GI"].replace(0, np.nan)
+    median_gi = df["GI"].median()
+    df["GI"] = df["GI"].fillna(median_gi)
+    print(f"✓ Food DB ready | GI range: {df['GI'].min():.0f}–{df['GI'].max():.0f} | median GI: {median_gi:.0f}")
     return df
 
 class FoodRankingEngine:
@@ -401,7 +431,7 @@ class FoodRankingEngine:
         else:
             filtered = df.copy()
 
-        # Safe fallback — always lowest GI foods, never random
+        # Safe fallback — lowest GI, never random
         if len(filtered) < 5:
             filtered = df.nsmallest(50, "GI")
 
@@ -460,7 +490,6 @@ class FoodRankingEngine:
                 subset = df[df["Category"].str.contains(pattern, case=False, na=False)]
             else:
                 subset = pd.DataFrame()
-            # Safe fallback — lowest GI foods, never random sample
             if len(subset) < 3:
                 subset = df.nsmallest(50, "GI")
             ranked = self.rank(subset, risk_level, current_glucose, top_k=3)
@@ -472,11 +501,11 @@ class FoodRankingEngine:
 
 class ActivityEngine:
     def recommend(self, risk_info: Dict) -> Dict:
-        risk       = risk_info["risk_level"]
-        glucose    = risk_info["current"]
-        spike      = risk_info["spike"]
-        hypo       = risk_info.get("hypo_risk", False)
-        rapid_drop = risk_info.get("rapid_drop_risk", False)
+        risk         = risk_info["risk_level"]
+        glucose      = risk_info["current"]
+        upward_spike = risk_info.get("upward_spike", 0)
+        hypo         = risk_info.get("hypo_risk", False)
+        drop_sev     = risk_info.get("drop_severity", "NORMAL")
 
         if hypo:
             return {
@@ -489,18 +518,40 @@ class ActivityEngine:
                 "evidence":       "Exercise contraindicated below 70 mg/dL",
                 "urgency_score":  1.0
             }
-        elif rapid_drop:
+        elif drop_sev == "HIGH_ALERT":
+            return {
+                "activity":       "REST — Sit down immediately",
+                "duration":       "20-30 min, recheck glucose",
+                "timing":         "NOW",
+                "intensity":      "None",
+                "calorie_burn":   "0 kcal",
+                "clinical_alert": "🚨 SEVERE DROP predicted — risk of hypoglycemia",
+                "evidence":       "Drop >70 mg/dL in 2h — immediate monitoring required",
+                "urgency_score":  0.95
+            }
+        elif drop_sev == "MODERATE_ALERT":
             return {
                 "activity":       "Seated Rest / Light Stretching",
                 "duration":       "15-20 minutes",
                 "timing":         "Monitor glucose every 15 min",
                 "intensity":      "Very Low",
                 "calorie_burn":   "20-40 kcal",
-                "clinical_alert": "⚠️ RAPID DROP detected — avoid strenuous activity",
-                "evidence":       "Rapid glucose decline may indicate insulin excess or poor absorption",
-                "urgency_score":  0.75
+                "clinical_alert": "⚠️ MODERATE DROP predicted — avoid strenuous activity",
+                "evidence":       "Drop >50 mg/dL — caution advised",
+                "urgency_score":  0.7
             }
-        elif glucose >= 200 or spike > 60:
+        elif drop_sev == "CAUTION":
+            return {
+                "activity":       "Light Walking only",
+                "duration":       "10-15 minutes",
+                "timing":         "After confirming glucose stable",
+                "intensity":      "Low",
+                "calorie_burn":   "40-60 kcal",
+                "clinical_alert": "⚠️ Mild drop predicted — light activity only",
+                "evidence":       "Drop >35 mg/dL — monitor trend",
+                "urgency_score":  0.4
+            }
+        elif glucose >= 200 or upward_spike > 60:
             return {
                 "activity":       "URGENT — Brisk Walking",
                 "duration":       "40-45 minutes",
