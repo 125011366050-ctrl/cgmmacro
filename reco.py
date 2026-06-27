@@ -17,7 +17,7 @@ warnings.filterwarnings("ignore")
 # CONFIG
 # =========================
 class Config:
-    DATA_PATH = "cgmacros_cleaned"
+   self.config.DATA_PATH = "."
     FOOD_FILE = "Indian_Foods_GI_GL_Database.xlsx"
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
