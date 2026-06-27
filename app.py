@@ -167,7 +167,7 @@ if st.button("🔍 Run Full Analysis", use_container_width=True):
                 styled = food_recs[show_cols].style.apply(highlight_spike, axis=1).format(fmt)
                 st.dataframe(styled, use_container_width=True, height=400)
             else:
-                st.info("No recommendations")
+                st.info("No recommendations available")
 
             st.markdown("---")
             st.subheader("🍽️ Personalised Meal Plan")
@@ -220,10 +220,36 @@ if st.button("🔍 Run Full Analysis", use_container_width=True):
             st.markdown("---")
             st.subheader("📋 Clinical Summary")
 
-            top_food, top_gi, top_spike = "N/A", "N/A", 0.0
-            if isinstance(food_recs, pd.DataFrame) and not food_recs.empty:
+            # FIXED: Proper try-except block
+            try:
                 top_food = food_recs.iloc[0].get("Food_Name", "N/A")
                 top_gi = food_recs.iloc[0].get("GI", "N/A")
                 top_spike = food_recs.iloc[0].get("Predicted_Spike", 0.0)
+            except Exception:
+                top_food = "N/A"
+                top_gi = "N/A"
+                top_spike = 0.0
 
-            urgency_label = "IMMEDIATE"
+            if risk_level == "HIGH":
+                urgency_label = "IMMEDIATE"
+            elif risk_level == "MEDIUM":
+                urgency_label = "SOON"
+            else:
+                urgency_label = "ROUTINE"
+
+            st.code(f"""CLINICAL SUMMARY — {result['timestamp']}
+==========================================
+Risk Level       : {risk_level} ({urgency_label})
+Current Glucose  : {current:.0f} mg/dL
+Predicted Peak   : {peak:.0f} mg/dL
+Glucose Spike    : {spike:.1f} mg/dL
+30-min Trend     : {trend:+.1f} mg/dL
+Action Required  : {risk['requires_action']}
+
+Top Food         : {top_food} (GI: {top_gi}, Spike: +{top_spike:.1f})
+Activity         : {act_name} — {duration}
+Alert            : {alert}""", language="text")
+
+        except Exception as e:
+            st.error(f"❌ Analysis failed: {e}")
+            st.exception(e)
