@@ -445,27 +445,73 @@ class PredictionEngine:
         velocity      = self._compute_glucose_velocity(current, predictions)
         velocity_risk = self._classify_velocity(velocity)
 
-        hypo_risk    = worst_trough < self.config.HYPO_THRESHOLD
-        hypo_warning = worst_trough < self.config.HYPO_WARNING
+        # ========== PATCH 1: Make hypo/hyper "persistent", not single-point ==========
+        # Instead of reacting to a single predicted dip, require majority of future points to be low
+        hypo_risk = np.mean(predictions < self.config.HYPO_THRESHOLD) >= 0.6
+        hypo_warning = np.mean(predictions < self.config.HYPO_WARNING) >= 0.5
 
+        # ========== PATCH 2: Stabilize hyperglycemia detection ==========
+        # Require current high AND sustained elevation in near-term predictions
+        hyper_risk = (
+            current >= self.config.CRITICAL_GLUCOSE
+            and np.mean(predictions[:2]) >= self.config.WARNING_GLUCOSE
+        )
+
+        # ========== PATCH 4: Reduce velocity noise impact ==========
+        # Only flag velocity if it's actually moving glucose significantly
+        velocity_high = abs(velocity) >= self.config.VELOCITY_HIGH_RISK and \
+                        abs(predictions[0] - current) >= 20
+
+        # Keep these for backward compatibility with drop/spike logic
         drop_risk_high   = downward_drop >= self.config.CRITICAL_DROP
         drop_risk_medium = downward_drop >= self.config.MODERATE_DROP
         spike_risk_high  = upward_spike  >= self.config.MEDIUM_SPIKE
         spike_risk_medium = upward_spike >= self.config.LOW_SPIKE
-        velocity_high    = abs(velocity) >= self.config.VELOCITY_HIGH_RISK
 
-        if (current >= self.config.CRITICAL_GLUCOSE or hypo_risk or
-                drop_risk_high or spike_risk_high or velocity_high):
+        # ========== PATCH 3: Make risk classification less "OR-heavy" ==========
+        # Use voting system instead of OR logic
+        high_flags = sum([
+            current >= self.config.CRITICAL_GLUCOSE,
+            hypo_risk,
+            drop_risk_high,
+            spike_risk_high and np.max(predictions) > current + 60,  # Only if spike is significant
+            velocity_high
+        ])
+
+        medium_flags = sum([
+            current >= self.config.WARNING_GLUCOSE,
+            hypo_warning,
+            drop_risk_medium,
+            spike_risk_medium
+        ])
+
+        if high_flags >= 2:
             risk_level = "HIGH"
-        elif (current >= self.config.WARNING_GLUCOSE or hypo_warning or
-              drop_risk_medium or spike_risk_medium or
-              drop_severity in ("MODERATE_ALERT", "CAUTION")):
+        elif medium_flags >= 2:
             risk_level = "MEDIUM"
         else:
             risk_level = "LOW"
 
-        if hypo_risk:
+        # ========== PATCH 5: Add smoothing gate for dominant risk ==========
+        def is_consistently_rising(arr, window=3):
+            """Check if values are consistently rising (with small tolerance)"""
+            if len(arr) < window:
+                return False
+            diffs = np.diff(arr[:window])
+            return np.all(diffs > -2)  # Allow tiny drops, but mostly rising
+
+        def is_consistently_falling(arr, window=3):
+            """Check if values are consistently falling (with small tolerance)"""
+            if len(arr) < window:
+                return False
+            diffs = np.diff(arr[:window])
+            return np.all(diffs < 2)  # Allow tiny rises, but mostly falling
+
+        # Determine dominant risk with confirmation
+        if hypo_risk and is_consistently_falling(predictions):
             dominant_risk = "HYPOGLYCEMIA"
+        elif hyper_risk and is_consistently_rising(predictions):
+            dominant_risk = "HYPERGLYCEMIA"
         elif drop_risk_high or drop_severity == "HIGH_ALERT":
             dominant_risk = "DROP_RISK"
         elif current >= self.config.CRITICAL_GLUCOSE or spike_risk_high:
