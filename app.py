@@ -386,9 +386,9 @@ class ClinicalRuleEngine:
         
         return risk, rules_triggered
 
-# ========== ========== FIX: ENGINE ADAPTER WITH CORRECT SIGNATURE ========== ==========
+# ========== ========== FIX: ENGINE ADAPTER WITH CORRECT TYPE HANDLING ========== ==========
 class EngineAdapter:
-    """Engine adapter that automatically detects and matches the correct signature"""
+    """Engine adapter that properly handles type conversion"""
     
     def __init__(self):
         self.config = Config()
@@ -397,65 +397,89 @@ class EngineAdapter:
         self._model_version = "v1.0"
     
     def predict(self, cgm_data: List[float], carbs: int, protein: int, fat: int) -> Dict:
-        """Universal adapter that tries multiple signature patterns"""
+        """
+        Universal adapter that properly converts types before calling engine.
         
-        # Prepare inputs
+        CRITICAL FIX: Ensures all values are scalar floats, not dicts.
+        """
+        
+        # ========== CRITICAL: Convert to scalar floats ==========
+        # This prevents the "float() argument must be string or real number, not dict" error
         cgm_array = np.array(cgm_data, dtype=np.float32)
-        meal_context = {
-            "carbs": carbs,
-            "protein": protein,
-            "fat": fat
-        }
+        carbs_float = float(carbs)
+        protein_float = float(protein)
+        fat_float = float(fat)
         top_k_value = 10
         
         # Get the actual function signature
         sig = inspect.signature(self.orchestrator.run)
         params = list(sig.parameters.keys())
         
-        # Try different calling patterns based on parameter names
+        # ========== Try different calling patterns ==========
         try:
-            # Pattern 1: Check if 'cgm' is a parameter
-            if 'cgm' in params:
+            # Pattern 1: Check if 'cgm_readings' is a parameter (your engine's actual signature)
+            if 'cgm_readings' in params:
+                result = self.orchestrator.run(
+                    cgm_readings=cgm_array,
+                    carbs=carbs_float,
+                    protein=protein_float,
+                    fat=fat_float,
+                    top_k=top_k_value
+                )
+                self._signature_used = "cgm_readings_keyword"
+                return result
+            
+            # Pattern 2: Check if 'cgm' is a parameter
+            elif 'cgm' in params:
                 result = self.orchestrator.run(
                     cgm=cgm_array,
-                    meal_context=meal_context,
+                    carbs=carbs_float,
+                    protein=protein_float,
+                    fat=fat_float,
                     top_k=top_k_value
                 )
                 self._signature_used = "cgm_keyword"
                 return result
             
-            # Pattern 2: Check if 'cgm_data' is a parameter
+            # Pattern 3: Check if 'cgm_data' is a parameter
             elif 'cgm_data' in params:
                 result = self.orchestrator.run(
                     cgm_data=cgm_array,
-                    meal_context=meal_context,
+                    carbs=carbs_float,
+                    protein=protein_float,
+                    fat=fat_float,
                     top_k=top_k_value
                 )
                 self._signature_used = "cgm_data_keyword"
                 return result
             
-            # Pattern 3: Check if 'data' is a parameter
+            # Pattern 4: Check if 'data' is a parameter
             elif 'data' in params:
                 result = self.orchestrator.run(
                     data=cgm_array,
-                    context=meal_context,
-                    k=top_k_value
+                    carbs=carbs_float,
+                    protein=protein_float,
+                    fat=fat_float,
+                    top_k=top_k_value
                 )
                 self._signature_used = "data_keyword"
                 return result
             
-            # Pattern 4: Positional arguments (no parameter names)
-            elif len(params) >= 2:
-                # Try positional: run(cgm_array, meal_context, top_k)
-                result = self.orchestrator.run(cgm_array, meal_context, top_k_value)
+            # Pattern 5: Positional arguments (no parameter names)
+            elif len(params) >= 4:
+                result = self.orchestrator.run(
+                    cgm_array, carbs_float, protein_float, fat_float, top_k_value
+                )
                 self._signature_used = "positional"
                 return result
             
             else:
-                # Pattern 5: Single dict argument
+                # Pattern 6: Single dict argument
                 result = self.orchestrator.run({
-                    "cgm": cgm_array,
-                    "meal_context": meal_context,
+                    "cgm_readings": cgm_array,
+                    "carbs": carbs_float,
+                    "protein": protein_float,
+                    "fat": fat_float,
                     "top_k": top_k_value
                 })
                 self._signature_used = "dict_input"
