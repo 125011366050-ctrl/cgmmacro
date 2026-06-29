@@ -1,11 +1,11 @@
 {
-  "functions": {
-    "api/*.py": {
-      "maxDuration": 30,
-      "memory": 1024
+  "builds": [
+    {
+      "src": "app.py",
+      "use": "@vercel/static-build",
+      "config": {
+        "buildCommand": "pip install -r requirements.txt"
+      }
     }
-  },
-  "rewrites": [
-    { "source": "/(.*)", "destination": "/engine.py" }
   ]
 }
