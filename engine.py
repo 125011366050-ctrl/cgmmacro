@@ -37,6 +37,7 @@ class Config:
     UNCERTAINTY_STD: Tuple[float, float, float] = (8.0, 12.0, 15.0)
     HYPO_THRESHOLD: float = 70.0
     HYPO_WARNING: float = 90.0
+    SEVERE_HYPO_THRESHOLD: float = 55.0  # NEW: For severe hypoglycemia
     CRITICAL_DROP: float = 50.0
     MODERATE_DROP: float = 35.0
     DROP_HIGH_ALERT: float = 70.0
@@ -44,6 +45,9 @@ class Config:
     DROP_CAUTION: float = 35.0
     VELOCITY_HIGH_RISK: float = 3.0
     VELOCITY_MEDIUM_RISK: float = 1.5
+    HYPERGLYCEMIA_THRESHOLD: float = 180.0  # NEW: For hyperglycemia override
+    RAPID_FALL_THRESHOLD: float = 30.0  # NEW: For rapid fall detection
+    RAPID_RISE_THRESHOLD: float = 40.0  # NEW: For rapid rise detection
 
 
 # ─────────────────────────────────────────────────────────────
@@ -217,7 +221,7 @@ def safe_risk(risk: dict) -> dict:
         "dominant_risk":    risk.get("dominant_risk", "NONE"),
         "risk_score":       risk.get("risk_score", 0.0),
         "clinical_summary": risk.get("clinical_summary", ""),
-        "trend_strength":   risk.get("trend_strength", 0.0),  # FIX 1: Add trend_strength
+        "trend_strength":   risk.get("trend_strength", 0.0),
         "uncertainty":      risk.get("uncertainty", {"lower": [], "upper": [], "std": []}),
     }
 
@@ -374,6 +378,8 @@ class PredictionEngine:
             return "NORMAL"
 
     def _compute_glucose_velocity(self, current: float, pred: np.ndarray) -> float:
+        # ========== FIX: Correct velocity calculation ==========
+        # Using first predicted point (30 min) - current over 30 minutes
         return float((pred[0] - current) / 30.0)
 
     def _classify_velocity(self, velocity: float) -> str:
@@ -460,8 +466,7 @@ class PredictionEngine:
         hypo_risk = np.mean(predictions < self.config.HYPO_THRESHOLD) >= 0.6
         hypo_warning = np.mean(predictions < self.config.HYPO_WARNING) >= 0.5
 
-        # ========== FIX 4: True trend-sensitive hyperglycemia ==========
-        # Multiple ways to detect hyperglycemia for robustness
+        # ========== FIX 4: Trend-sensitive hyperglycemia ==========
         hyper_risk = (
             # Threshold-based
             (current >= self.config.WARNING_GLUCOSE and np.max(predictions) >= self.config.WARNING_GLUCOSE) or
@@ -576,7 +581,7 @@ class PredictionEngine:
             "drop_severity":    drop_severity,
             "trend":            trend,
             "trend_direction":  trend_direction,
-            "trend_strength":   float(trend_strength),  # FIX 1: Return trend_strength
+            "trend_strength":   float(trend_strength),
             "glucose_velocity": round(velocity, 3),
             "velocity_risk":    velocity_risk,
             "hypo_risk":        hypo_risk,
@@ -939,6 +944,7 @@ class ClinicalOrchestrator:
         print("✓ CDSS ready")
 
     def run(self, cgm_readings, carbs=0, protein=0, fat=0, top_k=10) -> Dict:
+        """Main entry point - expects cgm_readings as list, carbs/protein/fat as numbers"""
         cgm_readings = list(cgm_readings)
         if len(cgm_readings) < 10:
             cgm_readings = ([cgm_readings[0]] * (10 - len(cgm_readings))) + cgm_readings
@@ -1036,6 +1042,7 @@ if __name__ == "__main__":
     print(f"Risk Score: {result['risk']['risk_score']}")
     print(f"Trend Strength: {result['risk']['trend_strength']:.2f}")
     print(f"Trend Direction: {result['risk']['trend_direction']}")
+    print(f"Glucose Velocity: {result['risk']['glucose_velocity']:.2f}")
     print(f"\nClinical Summary: {result['risk']['clinical_summary']}")
     
     print("\n" + "=" * 60)
@@ -1049,27 +1056,13 @@ if __name__ == "__main__":
     print("TOP FOOD RECOMMENDATIONS")
     print("=" * 60)
     
-    # ========== FIX 3: Safe DataFrame handling ==========
     food_df = pd.DataFrame(result["food_recommendations"])
     
     if not food_df.empty:
-        # Check which columns exist before printing
         available_cols = ['Food_Name', 'GI', 'GL', 'Predicted_Spike', 
                          'Score', 'Recommendation', 'Reason']
         existing_cols = [col for col in available_cols if col in food_df.columns]
-        
         print(food_df[existing_cols].head(10))
-        
-        # Print meal plan
-        print("\n" + "=" * 60)
-        print("MEAL PLAN")
-        print("=" * 60)
-        for meal, items in result['meal_plan'].items():
-            print(f"\n{meal}:")
-            for item in items[:2]:  # Show top 2 per meal
-                print(f"  - {item['Food_Name']} (GI: {item['GI']}, Score: {item['Score']:.2f})")
-                if 'Reason' in item:
-                    print(f"    Reason: {item['Reason']}")
     else:
         print("No food recommendations available.")
     
