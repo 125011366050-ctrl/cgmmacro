@@ -6,7 +6,7 @@ import joblib
 import os
 import warnings
 from datetime import datetime
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List
 from dataclasses import dataclass
 from pytorch_tabnet.tab_model import TabNetRegressor
 
@@ -63,10 +63,10 @@ def ensure_file(filename: str, base_dir: str, required: bool = True) -> str:
     local_path = os.path.join(base_dir, filename)
     if os.path.exists(local_path):
         return local_path
-
+    
     file_id = REMOTE_FILES.get(filename, "")
     placeholder = file_id.startswith("PUT_") or not file_id
-
+    
     if placeholder:
         if required:
             raise FileNotFoundError(
@@ -78,7 +78,7 @@ def ensure_file(filename: str, base_dir: str, required: bool = True) -> str:
         else:
             print(f"⚠️ Optional file '{filename}' not found and not configured — skipping.")
             return local_path
-
+    
     try:
         import gdown
     except ImportError:
@@ -86,11 +86,11 @@ def ensure_file(filename: str, base_dir: str, required: bool = True) -> str:
             "gdown is not installed. Add 'gdown' to requirements.txt to enable "
             "automatic model downloads."
         )
-
+    
     print(f"⬇️ Downloading '{filename}' from Google Drive (id={file_id})...")
     url = f"https://drive.google.com/uc?id={file_id}"
     gdown.download(url, local_path, quiet=False)
-
+    
     if not os.path.exists(local_path):
         raise FileNotFoundError(
             f"Download of '{filename}' failed — file still missing at {local_path}. "
@@ -217,12 +217,13 @@ def safe_risk(risk: dict) -> dict:
         "dominant_risk":    risk.get("dominant_risk", "NONE"),
         "risk_score":       risk.get("risk_score", 0.0),
         "clinical_summary": risk.get("clinical_summary", ""),
+        "trend_strength":   risk.get("trend_strength", 0.0),  # FIX 1: Add trend_strength
         "uncertainty":      risk.get("uncertainty", {"lower": [], "upper": [], "std": []}),
     }
 
 
 def soft_physiology_adjust(pred: np.ndarray, current: float,
-                            max_step: float = 60.0) -> np.ndarray:
+                           max_step: float = 60.0) -> np.ndarray:
     pred = pred.copy().astype(np.float32)
     all_points = np.insert(pred, 0, current)
     diffs = np.diff(all_points)
@@ -334,33 +335,33 @@ class PredictionEngine:
         t = torch.from_numpy(x_scaled).float().to(self.device)
         with torch.no_grad():
             emb = self.lstm.get_embedding(t).cpu().numpy().astype(np.float32)
-        emb = emb.reshape(emb.shape[0], -1)
+            emb = emb.reshape(emb.shape[0], -1)
 
-        if self.embedding_scaler is not None:
-            emb = self.embedding_scaler.transform(emb)
-        else:
-            emb_mean = np.mean(emb, axis=1, keepdims=True)
-            emb_std = np.std(emb, axis=1, keepdims=True)
-            emb = (emb - emb_mean) / (emb_std + 1e-6)
+            if self.embedding_scaler is not None:
+                emb = self.embedding_scaler.transform(emb)
+            else:
+                emb_mean = np.mean(emb, axis=1, keepdims=True)
+                emb_std = np.std(emb, axis=1, keepdims=True)
+                emb = (emb - emb_mean) / (emb_std + 1e-6)
             emb = np.clip(emb, -5, 5)
-        emb = np.nan_to_num(emb, nan=0.0, posinf=0.0, neginf=0.0)
+            emb = np.nan_to_num(emb, nan=0.0, posinf=0.0, neginf=0.0)
 
-        raw = self.tabnet.predict(emb)
-        raw = np.array(raw, dtype=np.float32).flatten()
+            raw = self.tabnet.predict(emb)
+            raw = np.array(raw, dtype=np.float32).flatten()
 
-        pred = self._inverse_scale(raw)
-        pred = np.clip(pred, 40, 400)
+            pred = self._inverse_scale(raw)
+            pred = np.clip(pred, 40, 400)
 
-        if len(pred) == 1:
-            base_val = float(pred[0])
-            pred = np.array([base_val, base_val * 1.01, base_val * 1.02], dtype=np.float32)
+            if len(pred) == 1:
+                base_val = float(pred[0])
+                pred = np.array([base_val, base_val * 1.01, base_val * 1.02], dtype=np.float32)
 
-        pred = soft_physiology_adjust(pred, current_glucose, self.config.SOFT_MAX_STEP)
-        pred = np.clip(pred, 40, 400)
+            pred = soft_physiology_adjust(pred, current_glucose, self.config.SOFT_MAX_STEP)
+            pred = np.clip(pred, 40, 400)
 
-        mean_pred, lower, upper = add_uncertainty(pred, self.config.UNCERTAINTY_STD)
+            mean_pred, lower, upper = add_uncertainty(pred, self.config.UNCERTAINTY_STD)
 
-        return mean_pred, lower, upper
+            return mean_pred, lower, upper
 
     def _classify_drop(self, drop: float) -> str:
         if drop >= self.config.DROP_HIGH_ALERT:
@@ -384,8 +385,8 @@ class PredictionEngine:
         return "STABLE"
 
     def _compute_risk_score(self, current: float, upward_spike: float,
-                             downward_drop: float, trough: float,
-                             velocity: float) -> float:
+                            downward_drop: float, trough: float,
+                            velocity: float) -> float:
         hyper_score    = min(1.0, max(0.0, (current - 140) / 100.0))
         spike_score    = min(1.0, upward_spike / 80.0)
         drop_score     = min(1.0, downward_drop / 80.0)
@@ -401,12 +402,13 @@ class PredictionEngine:
         return round(float(np.clip(score, 0.0, 1.0)), 3)
 
     def _build_clinical_summary(self, risk_level: str, dominant_risk: str,
-                                  current: float, trough: float,
-                                  upward_spike: float, downward_drop: float,
-                                  velocity: float, hypo_risk: bool,
-                                  hypo_warning: bool) -> str:
+                                current: float, trough: float,
+                                upward_spike: float, downward_drop: float,
+                                velocity: float, hypo_risk: bool,
+                                hypo_warning: bool, trend_strength: float) -> str:
         direction = "falling" if velocity < 0 else "rising"
         rate = abs(round(velocity, 2))
+        
         if dominant_risk == "HYPOGLYCEMIA":
             return (f"HYPOGLYCEMIA ALERT: Glucose {current:.0f} mg/dL falling at "
                     f"{rate} mg/dL/min. Predicted trough {trough:.0f} mg/dL — "
@@ -416,8 +418,14 @@ class PredictionEngine:
                     f"{rate} mg/dL/min. Predicted drop of {downward_drop:.0f} mg/dL "
                     f"to {trough:.0f} mg/dL over 2 hours.")
         elif dominant_risk == "HYPERGLYCEMIA":
-            return (f"HIGH GLUCOSE: Current {current:.0f} mg/dL with predicted spike "
-                    f"of {upward_spike:.0f} mg/dL. Glucose control intervention needed.")
+            if trend_strength > 1.5:
+                return (f"HIGH GLUCOSE RISING: Current {current:.0f} mg/dL with rapid "
+                        f"rise at {rate} mg/dL/min (trend strength {trend_strength:.1f}). "
+                        f"Predicted spike of {upward_spike:.0f} mg/dL. "
+                        f"Immediate glucose control intervention needed.")
+            else:
+                return (f"HIGH GLUCOSE: Current {current:.0f} mg/dL with predicted spike "
+                        f"of {upward_spike:.0f} mg/dL. Glucose control intervention needed.")
         elif dominant_risk == "HYPO_WARNING":
             return (f"EARLY WARNING: Glucose {current:.0f} mg/dL trending {direction}. "
                     f"Predicted to reach {trough:.0f} mg/dL — approaching caution zone.")
@@ -445,79 +453,100 @@ class PredictionEngine:
         velocity      = self._compute_glucose_velocity(current, predictions)
         velocity_risk = self._classify_velocity(velocity)
 
-        # ========== PATCH 1: Make hypo/hyper "persistent", not single-point ==========
-        # Instead of reacting to a single predicted dip, require majority of future points to be low
+        # ========== FIX 1: Add trend_strength ==========
+        trend_strength = float(np.polyfit(range(len(predictions)), predictions, 1)[0])
+
+        # Hypo detection
         hypo_risk = np.mean(predictions < self.config.HYPO_THRESHOLD) >= 0.6
         hypo_warning = np.mean(predictions < self.config.HYPO_WARNING) >= 0.5
 
-        # ========== PATCH 2: Stabilize hyperglycemia detection ==========
-        # Require current high AND sustained elevation in near-term predictions
+        # ========== FIX 4: True trend-sensitive hyperglycemia ==========
+        # Multiple ways to detect hyperglycemia for robustness
         hyper_risk = (
-            current >= self.config.CRITICAL_GLUCOSE
-            and np.mean(predictions[:2]) >= self.config.WARNING_GLUCOSE
+            # Threshold-based
+            (current >= self.config.WARNING_GLUCOSE and np.max(predictions) >= self.config.WARNING_GLUCOSE) or
+            # Trend-based - pattern aware
+            (trend_strength > 1.5 and current >= 150) or
+            # Mean-based
+            (np.mean(predictions >= self.config.WARNING_GLUCOSE) >= 0.5)
         )
+        
+        # If strongly rising, definitely flag hyperglycemia
+        if trend_strength > 2.0 and current >= 140:
+            hyper_risk = True
 
-        # ========== PATCH 4: Reduce velocity noise impact ==========
-        # Only flag velocity if it's actually moving glucose significantly
+        # Velocity noise reduction
         velocity_high = abs(velocity) >= self.config.VELOCITY_HIGH_RISK and \
                         abs(predictions[0] - current) >= 20
 
-        # Keep these for backward compatibility with drop/spike logic
         drop_risk_high   = downward_drop >= self.config.CRITICAL_DROP
         drop_risk_medium = downward_drop >= self.config.MODERATE_DROP
-        spike_risk_high  = upward_spike  >= self.config.MEDIUM_SPIKE
+        spike_risk_high  = upward_spike >= self.config.MEDIUM_SPIKE
         spike_risk_medium = upward_spike >= self.config.LOW_SPIKE
 
-        # ========== PATCH 3: Make risk classification less "OR-heavy" ==========
-        # Use voting system instead of OR logic
-        high_flags = sum([
-            current >= self.config.CRITICAL_GLUCOSE,
-            hypo_risk,
-            drop_risk_high,
-            spike_risk_high and np.max(predictions) > current + 60,  # Only if spike is significant
-            velocity_high
-        ])
-
-        medium_flags = sum([
-            current >= self.config.WARNING_GLUCOSE,
-            hypo_warning,
-            drop_risk_medium,
-            spike_risk_medium
-        ])
-
-        if high_flags >= 2:
+        # ========== SCORE-BASED RISK SELECTION ==========
+        hypo_score = int(hypo_risk) * 3 + int(hypo_warning) * 2
+        drop_score = int(drop_risk_high) * 3 + int(drop_risk_medium) * 2
+        hyper_score = int(hyper_risk) * 3 + int(spike_risk_high) * 2 + int(spike_risk_medium) * 1
+        velocity_score = int(velocity_high) * 2
+        
+        # Add trend strength bonus for hyperglycemia
+        if trend_strength > 1.0:
+            hyper_score += 1
+        if trend_strength > 1.5:
+            hyper_score += 1
+        if trend_strength > 2.0:
+            hyper_score += 1
+        
+        risk_scores = {
+            "HYPOGLYCEMIA": hypo_score,
+            "DROP_RISK": drop_score,
+            "HYPERGLYCEMIA": hyper_score,
+            "VELOCITY_RISK": velocity_score
+        }
+        
+        # Determine risk level
+        if max(risk_scores.values()) >= 3:
             risk_level = "HIGH"
-        elif medium_flags >= 2:
+        elif max(risk_scores.values()) >= 2:
             risk_level = "MEDIUM"
         else:
             risk_level = "LOW"
-
-        # ========== PATCH 5: Add smoothing gate for dominant risk ==========
+        
+        # ========== DOMINANT RISK SELECTION ==========
         def is_consistently_rising(arr, window=3):
-            """Check if values are consistently rising (with small tolerance)"""
             if len(arr) < window:
                 return False
             diffs = np.diff(arr[:window])
-            return np.all(diffs > -2)  # Allow tiny drops, but mostly rising
+            return np.all(diffs > -2)
 
         def is_consistently_falling(arr, window=3):
-            """Check if values are consistently falling (with small tolerance)"""
             if len(arr) < window:
                 return False
             diffs = np.diff(arr[:window])
-            return np.all(diffs < 2)  # Allow tiny rises, but mostly falling
+            return np.all(diffs < 2)
 
-        # Determine dominant risk with confirmation
-        if hypo_risk and is_consistently_falling(predictions):
-            dominant_risk = "HYPOGLYCEMIA"
-        elif hyper_risk and is_consistently_rising(predictions):
-            dominant_risk = "HYPERGLYCEMIA"
-        elif drop_risk_high or drop_severity == "HIGH_ALERT":
-            dominant_risk = "DROP_RISK"
-        elif current >= self.config.CRITICAL_GLUCOSE or spike_risk_high:
-            dominant_risk = "HYPERGLYCEMIA"
-        elif hypo_warning or drop_risk_medium:
-            dominant_risk = "HYPO_WARNING"
+        max_score = max(risk_scores.values())
+        top_risks = [r for r, s in risk_scores.items() if s == max_score]
+        
+        if max_score >= 3:
+            if "HYPOGLYCEMIA" in top_risks and is_consistently_falling(predictions):
+                dominant_risk = "HYPOGLYCEMIA"
+            elif "HYPERGLYCEMIA" in top_risks and (is_consistently_rising(predictions) or trend_strength > 1.0):
+                dominant_risk = "HYPERGLYCEMIA"
+            elif "DROP_RISK" in top_risks:
+                dominant_risk = "DROP_RISK"
+            else:
+                dominant_risk = top_risks[0]
+        elif max_score >= 2:
+            if "HYPERGLYCEMIA" in top_risks:
+                dominant_risk = "HYPERGLYCEMIA"
+            elif "HYPOGLYCEMIA" in top_risks:
+                dominant_risk = "HYPOGLYCEMIA"
+            elif "DROP_RISK" in top_risks:
+                dominant_risk = "DROP_RISK"
+            else:
+                dominant_risk = top_risks[0]
         else:
             dominant_risk = "NONE"
 
@@ -526,7 +555,8 @@ class PredictionEngine:
         )
         clinical_summary = self._build_clinical_summary(
             risk_level, dominant_risk, current, trough,
-            upward_spike, downward_drop, velocity, hypo_risk, hypo_warning
+            upward_spike, downward_drop, velocity, hypo_risk, 
+            hypo_warning, trend_strength
         )
 
         return {
@@ -546,6 +576,7 @@ class PredictionEngine:
             "drop_severity":    drop_severity,
             "trend":            trend,
             "trend_direction":  trend_direction,
+            "trend_strength":   float(trend_strength),  # FIX 1: Return trend_strength
             "glucose_velocity": round(velocity, 3),
             "velocity_risk":    velocity_risk,
             "hypo_risk":        hypo_risk,
@@ -626,7 +657,7 @@ class FoodRankingEngine:
         return float(np.clip(spike, 0, 200))
 
     def filter_by_risk(self, df: pd.DataFrame, risk_level: str,
-                        dominant_risk: str = "NONE") -> pd.DataFrame:
+                       dominant_risk: str = "NONE") -> pd.DataFrame:
         if dominant_risk == "HYPOGLYCEMIA":
             filtered = df[df["GI"] >= 55]
             if len(filtered) < 5:
@@ -651,23 +682,70 @@ class FoodRankingEngine:
 
     def rank(self, df: pd.DataFrame, risk_level: str,
              current_glucose: float, top_k: int = 10,
-             dominant_risk: str = "NONE") -> pd.DataFrame:
+             dominant_risk: str = "NONE",
+             future_glucose: float = None,
+             predictions: List[float] = None) -> pd.DataFrame:
+        
         if df.empty:
             return pd.DataFrame()
+        
         filtered = self.filter_by_risk(df, risk_level, dominant_risk)
         out = filtered.copy()
+        
+        # Use predicted glucose for spike estimation
+        if future_glucose is None:
+            future_glucose = current_glucose
+        
+        # Calculate spikes based on both current and future glucose
         spikes = np.array([
-            self.estimate_spike(row.to_dict(), current_glucose)
+            self.estimate_spike(row.to_dict(), future_glucose)
             for _, row in out.iterrows()
         ], dtype=float)
+        
+        # Calculate projected glucose if food is consumed
         out["Predicted_Spike"] = spikes
-        out["Predicted_Peak"] = spikes + current_glucose
+        out["Predicted_Peak"] = spikes + future_glucose
+        out["Current_Glucose"] = current_glucose
+        
+        # ========== FIX 2: Add Reason column ==========
+        out["Reason"] = np.where(
+            out["Predicted_Spike"] > 40,
+            "High glycemic impact - choose carefully",
+            "Low glycemic impact - good choice"
+        )
+        
+        # If we have predictions, add more detailed reasoning
+        if predictions is not None and len(predictions) >= 3:
+            out["Pred_30min"] = predictions[0]
+            out["Pred_60min"] = predictions[1]
+            out["Pred_120min"] = predictions[2]
+            
+            avg_pred = np.mean(predictions)
+            if avg_pred > 180:
+                out["Reason"] = "Predicted high glucose - low GI recommended"
+            elif avg_pred < 100:
+                out["Reason"] = "Predicted low glucose - higher GI acceptable"
+            else:
+                out["Reason"] = "Balanced glucose - maintain healthy choices"
+            
+            # Calculate target zone
+            if np.mean(predictions) > 180:
+                out["Target_Score"] = 1.0 - (out["Predicted_Spike"] / 80.0)
+            elif np.mean(predictions) < 100:
+                out["Target_Score"] = out["Predicted_Spike"] / 80.0
+            else:
+                out["Target_Score"] = 0.5
+        else:
+            out["Target_Score"] = 0.5
+        
+        # Normalize features
         spike_n = self._normalize(spikes)
         gi_n    = self._normalize(out["GI"].values)
         gl_n    = self._normalize(out["GL"].values)
         prot_n  = self._normalize(out["Protein"].values)
         fiber_n = self._normalize(out["Fiber"].values)
-
+        
+        # Adjust weights based on predicted glucose
         if dominant_risk == "HYPOGLYCEMIA":
             w = dict(spike=0.05, gi=0.10, gl=0.10, protein=0.35, fiber=0.40)
         elif dominant_risk in ("DROP_RISK", "HYPO_WARNING"):
@@ -678,14 +756,31 @@ class FoodRankingEngine:
             w = dict(spike=0.25, gi=0.25, gl=0.20, protein=0.15, fiber=0.15)
         else:
             w = dict(spike=0.15, gi=0.20, gl=0.15, protein=0.25, fiber=0.25)
-
-        out["Score"] = (
-            w["spike"] * (1 - spike_n) +
-            w["gi"]    * (1 - gi_n)    +
-            w["gl"]    * (1 - gl_n)    +
-            w["protein"] * prot_n      +
-            w["fiber"]   * fiber_n
-        )
+        
+        # Add target weight if we have predictions
+        if predictions is not None:
+            w["target"] = 0.20
+            total = sum(w.values())
+            for key in w:
+                w[key] = w[key] / (total + 0.20)
+            
+            out["Score"] = (
+                w["spike"] * (1 - spike_n) +
+                w["gi"]    * (1 - gi_n)    +
+                w["gl"]    * (1 - gl_n)    +
+                w["protein"] * prot_n      +
+                w["fiber"]   * fiber_n     +
+                w["target"] * out["Target_Score"]
+            )
+        else:
+            out["Score"] = (
+                w["spike"] * (1 - spike_n) +
+                w["gi"]    * (1 - gi_n)    +
+                w["gl"]    * (1 - gl_n)    +
+                w["protein"] * prot_n      +
+                w["fiber"]   * fiber_n
+            )
+        
         out = out.sort_values("Score", ascending=False).head(top_k).reset_index(drop=True)
         out["Rank"] = range(1, len(out) + 1)
         out["Recommendation"] = out["Score"].apply(
@@ -693,10 +788,13 @@ class FoodRankingEngine:
             else "👍 Good Choice" if s > 0.55
             else "✓ Acceptable"
         )
+        
         return out
 
     def meal_plan(self, df: pd.DataFrame, risk_level: str,
-                  current_glucose: float, dominant_risk: str = "NONE") -> Dict:
+                  current_glucose: float, dominant_risk: str = "NONE",
+                  future_glucose: float = None,
+                  predictions: List[float] = None) -> Dict:
         meal_keywords = {
             "Breakfast": ["Breakfast", "Idli", "Dosa", "Porridge", "Oats", "Upma"],
             "Lunch":     ["Rice", "Dal", "Curry", "Wheat", "Lentil", "Sabzi"],
@@ -713,10 +811,13 @@ class FoodRankingEngine:
             if len(subset) < 3:
                 subset = df.nsmallest(50, "GI")
             ranked = self.rank(subset, risk_level, current_glucose,
-                               top_k=3, dominant_risk=dominant_risk)
+                             top_k=3, dominant_risk=dominant_risk,
+                             future_glucose=future_glucose,
+                             predictions=predictions)
             if not ranked.empty:
                 plan[meal] = ranked[["Food_Name", "GI", "GL",
-                                      "Predicted_Spike", "Score"]].to_dict("records")
+                                    "Predicted_Spike", "Score",
+                                    "Reason", "Recommendation"]].to_dict("records")
             else:
                 plan[meal] = []
         return plan
@@ -856,15 +957,37 @@ class ClinicalOrchestrator:
         )
         risk_safe = safe_risk(risk_info)
         dominant  = risk_safe["dominant_risk"]
+        
+        # Calculate future glucose for food recommendation
+        pred_30 = mean_pred[0]
+        pred_60 = mean_pred[1]
+        pred_120 = mean_pred[2]
+        
+        # Weighted average favoring near-term predictions
+        future_glucose = 0.5 * pred_30 + 0.3 * pred_60 + 0.2 * pred_120
+        
+        predictions_list = [pred_30, pred_60, pred_120]
 
+        # Pass future glucose to food ranking
         food_recs = self.ranking_engine.rank(
-            self.food_df, risk_safe["risk_level"], current_glucose,
-            top_k=top_k, dominant_risk=dominant
+            self.food_df, 
+            risk_safe["risk_level"], 
+            current_glucose,
+            top_k=top_k, 
+            dominant_risk=dominant,
+            future_glucose=future_glucose,
+            predictions=predictions_list
         )
+        
         meal_plan = self.ranking_engine.meal_plan(
-            self.food_df, risk_safe["risk_level"], current_glucose,
-            dominant_risk=dominant
+            self.food_df, 
+            risk_safe["risk_level"], 
+            current_glucose,
+            dominant_risk=dominant,
+            future_glucose=future_glucose,
+            predictions=predictions_list
         )
+        
         activity = self.activity_engine.recommend(risk_info)
 
         return {
@@ -886,8 +1009,75 @@ class ClinicalOrchestrator:
                     "lower": round(float(lower[2]), 1),
                     "upper": round(float(upper[2]), 1),
                 },
+                "weighted_future": round(float(future_glucose), 1),
+                "max_future": round(float(max(predictions_list)), 1),
+                "min_future": round(float(min(predictions_list)), 1),
             },
             "food_recommendations": food_recs,
             "meal_plan":            meal_plan,
             "activity":             activity,
         }
+
+
+# ========== SAFE TESTING CODE ==========
+if __name__ == "__main__":
+    # Test with rising pattern
+    cgm_readings = [140, 145, 150, 155, 160, 165, 170, 175, 180, 185]
+    
+    config = Config()
+    orchestrator = ClinicalOrchestrator(config)
+    result = orchestrator.run(cgm_readings)
+    
+    print("=" * 60)
+    print("RISK ANALYSIS")
+    print("=" * 60)
+    print(f"Risk Level: {result['risk']['risk_level']}")
+    print(f"Dominant Risk: {result['risk']['dominant_risk']}")
+    print(f"Risk Score: {result['risk']['risk_score']}")
+    print(f"Trend Strength: {result['risk']['trend_strength']:.2f}")
+    print(f"Trend Direction: {result['risk']['trend_direction']}")
+    print(f"\nClinical Summary: {result['risk']['clinical_summary']}")
+    
+    print("\n" + "=" * 60)
+    print("PREDICTIONS")
+    print("=" * 60)
+    for horizon in ['30min', '60min', '120min']:
+        pred = result['predictions'][horizon]
+        print(f"{horizon}: {pred['mean']:.1f} mg/dL (range: {pred['lower']:.1f} - {pred['upper']:.1f})")
+    
+    print("\n" + "=" * 60)
+    print("TOP FOOD RECOMMENDATIONS")
+    print("=" * 60)
+    
+    # ========== FIX 3: Safe DataFrame handling ==========
+    food_df = pd.DataFrame(result["food_recommendations"])
+    
+    if not food_df.empty:
+        # Check which columns exist before printing
+        available_cols = ['Food_Name', 'GI', 'GL', 'Predicted_Spike', 
+                         'Score', 'Recommendation', 'Reason']
+        existing_cols = [col for col in available_cols if col in food_df.columns]
+        
+        print(food_df[existing_cols].head(10))
+        
+        # Print meal plan
+        print("\n" + "=" * 60)
+        print("MEAL PLAN")
+        print("=" * 60)
+        for meal, items in result['meal_plan'].items():
+            print(f"\n{meal}:")
+            for item in items[:2]:  # Show top 2 per meal
+                print(f"  - {item['Food_Name']} (GI: {item['GI']}, Score: {item['Score']:.2f})")
+                if 'Reason' in item:
+                    print(f"    Reason: {item['Reason']}")
+    else:
+        print("No food recommendations available.")
+    
+    print("\n" + "=" * 60)
+    print("ACTIVITY RECOMMENDATION")
+    print("=" * 60)
+    activity = result['activity']
+    print(f"Activity: {activity['activity']}")
+    print(f"Duration: {activity['duration']}")
+    print(f"Intensity: {activity['intensity']}")
+    print(f"Clinical Alert: {activity['clinical_alert']}")
