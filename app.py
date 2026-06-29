@@ -29,6 +29,9 @@ CGM_INTERVAL_MINUTES = 5
 VELOCITY_THRESHOLD = 0.5
 HYPO_THRESHOLD = 70.0
 HYPER_THRESHOLD = 180.0
+SEVERE_HYPO_THRESHOLD = 55.0
+RAPID_FALL_THRESHOLD = 30.0
+RAPID_RISE_THRESHOLD = 40.0
 
 # ========== STYLES ==========
 st.markdown("""
@@ -43,6 +46,7 @@ st.markdown("""
         .confidence-high { color: #28a745; font-weight: bold; }
         .confidence-medium { color: #ffc107; font-weight: bold; }
         .confidence-low { color: #dc3545; font-weight: bold; }
+        .clinical-rule { background-color: #d4edda; border-left: 4px solid #28a745; padding: 10px; margin: 5px 0; border-radius: 4px; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -74,6 +78,7 @@ class ClinicalReasoningEngine:
         """Generate comprehensive clinical reasoning"""
         
         risk_level = risk.get('risk_level', 'LOW')
+        dominant = risk.get('dominant_risk', 'NONE')
         peak = risk.get('peak', current)
         trough = risk.get('trough', current)
         
@@ -109,12 +114,13 @@ class ClinicalReasoningEngine:
         
         # Risk-specific reasoning
         if risk_level == "HIGH":
-            if peak > HYPER_THRESHOLD:
+            if dominant == "HYPERGLYCEMIA" or peak > HYPER_THRESHOLD:
                 parts.append(f"Predicted peak of {peak:.0f} mg/dL indicates hyperglycemia risk")
-            if trough < HYPO_THRESHOLD:
+                actionable = True
+            if dominant == "HYPOGLYCEMIA" or trough < HYPO_THRESHOLD:
                 parts.append(f"Predicted trough of {trough:.0f} mg/dL indicates hypoglycemia risk")
+                actionable = True
             parts.append("🚨 Immediate clinical attention recommended")
-            actionable = True
         elif risk_level == "MEDIUM":
             if peak > 140:
                 parts.append(f"Predicted peak of {peak:.0f} mg/dL above normal range")
@@ -138,6 +144,7 @@ class ClinicalReasoningEngine:
         self.reasoning_history.append({
             'timestamp': datetime.now().isoformat(),
             'risk_level': risk_level,
+            'dominant_risk': dominant,
             'reasoning': full_reasoning,
             'actionable': actionable,
             'rule_overrides': rule_overrides
@@ -338,57 +345,107 @@ class ClinicalGuard:
     def normalize_meal_plan(meal_plan: Any) -> Dict:
         return meal_plan if isinstance(meal_plan, dict) else {}
 
-# ========== CLINICAL RULE ENGINE ==========
+# ========== ========== FIX: CLINICAL RULE ENGINE WITH CORRECT PRIORITY ========== ==========
 class ClinicalRuleEngine:
+    """
+    Hospital-grade clinical rule engine with proper priority:
+    1. Severe hypoglycemia (<55) - HIGHEST
+    2. Hypoglycemia (<70) - HIGH
+    3. Hyperglycemia (>180) - HIGH
+    4. Rapid fall/rise - MEDIUM
+    5. Trend only - LOW
+    """
+    
     @staticmethod
     def apply_rules(cgm_data: List[float], preds: Dict, risk: Dict) -> Tuple[Dict, List[str]]:
+        """Apply clinical safety rules with correct priority hierarchy"""
+        
         if not cgm_data or len(cgm_data) == 0:
             return risk, []
         
         current = cgm_data[-1]
         rules_triggered = []
         override_risk = None
+        override_dominant = None
+        override_trend = None
         
-        if current < HYPO_THRESHOLD:
+        # ========== RULE 1: Severe hypoglycemia (HIGHEST PRIORITY) ==========
+        if current < SEVERE_HYPO_THRESHOLD:
             override_risk = "HIGH"
-            rules_triggered.append(f"🚨 CLINICAL RULE: Current glucose {current:.0f} mg/dL below {HYPO_THRESHOLD:.0f} mg/dL threshold - HIGH risk override")
+            override_dominant = "HYPOGLYCEMIA"
+            override_trend = "FALLING"  # Force falling trend for severe cases
+            rules_triggered.append(
+                f"🚨 CRITICAL RULE: Current glucose {current:.0f} mg/dL below {SEVERE_HYPO_THRESHOLD:.0f} mg/dL - SEVERE HYPOGLYCEMIA"
+            )
         
-        if current < 55:
+        # ========== RULE 2: Hypoglycemia (HIGH PRIORITY) ==========
+        elif current < HYPO_THRESHOLD:
             override_risk = "HIGH"
-            rules_triggered.append(f"🚨 CRITICAL RULE: Current glucose {current:.0f} mg/dL - SEVERE hypoglycemia")
+            override_dominant = "HYPOGLYCEMIA"
+            override_trend = "FALLING"
+            rules_triggered.append(
+                f"🚨 CLINICAL RULE: Current glucose {current:.0f} mg/dL below {HYPO_THRESHOLD:.0f} mg/dL - HYPOGLYCEMIA RISK"
+            )
         
-        if current > HYPER_THRESHOLD:
-            if override_risk is None or override_risk == "LOW":
-                override_risk = "HIGH"
-            rules_triggered.append(f"⚠️ CLINICAL RULE: Current glucose {current:.0f} mg/dL above {HYPER_THRESHOLD:.0f} mg/dL threshold - HIGH risk override")
+        # ========== RULE 3: Hyperglycemia (HIGH PRIORITY) ==========
+        elif current > HYPER_THRESHOLD:
+            override_risk = "HIGH"
+            override_dominant = "HYPERGLYCEMIA"
+            override_trend = "RISING"  # Force rising trend for hyperglycemia
+            rules_triggered.append(
+                f"⚠️ CLINICAL RULE: Current glucose {current:.0f} mg/dL above {HYPER_THRESHOLD:.0f} mg/dL - HYPERGLYCEMIA"
+            )
         
-        if len(cgm_data) >= 3:
+        # ========== RULE 4: Rapid fall (MEDIUM PRIORITY) ==========
+        elif len(cgm_data) >= 3:
             fall = cgm_data[-1] - cgm_data[-3]
-            if fall < -30:
-                if override_risk is None or override_risk == "LOW":
+            if fall < -RAPID_FALL_THRESHOLD:
+                if override_risk is None:
                     override_risk = "MEDIUM"
-                rules_triggered.append(f"⚠️ CLINICAL RULE: Rapid fall of {abs(fall):.0f} mg/dL detected - MEDIUM risk override")
+                    override_dominant = "DROP_RISK"
+                    override_trend = "FALLING"
+                rules_triggered.append(
+                    f"⚠️ CLINICAL RULE: Rapid fall of {abs(fall):.0f} mg/dL detected - MONITOR CLOSELY"
+                )
         
-        if len(cgm_data) >= 3:
+        # ========== RULE 5: Rapid rise (MEDIUM PRIORITY) ==========
+        elif len(cgm_data) >= 3:
             rise = cgm_data[-1] - cgm_data[-3]
-            if rise > 40:
-                if override_risk is None or override_risk == "LOW":
+            if rise > RAPID_RISE_THRESHOLD:
+                if override_risk is None:
                     override_risk = "MEDIUM"
-                rules_triggered.append(f"⚠️ CLINICAL RULE: Rapid rise of {rise:.0f} mg/dL detected - MEDIUM risk override")
+                    override_dominant = "HYPERGLYCEMIA"
+                    override_trend = "RISING"
+                rules_triggered.append(
+                    f"⚠️ CLINICAL RULE: Rapid rise of {rise:.0f} mg/dL detected - MONITOR CLOSELY"
+                )
         
+        # ========== Apply overrides ==========
         if override_risk is not None:
             model_risk = risk.get('risk_level', 'LOW')
             risk_priority = {'HIGH': 3, 'MEDIUM': 2, 'LOW': 1, 'UNKNOWN': 0}
+            
+            # Only override if rule priority is higher than model
             if risk_priority.get(override_risk, 0) > risk_priority.get(model_risk, 0):
                 risk['risk_level'] = override_risk
                 risk['requires_action'] = True
+                if override_dominant:
+                    risk['dominant_risk'] = override_dominant
+                if override_trend:
+                    risk['trend_direction'] = override_trend
                 risk['clinical_summary'] = f"[RULE OVERRIDE] {risk.get('clinical_summary', '')}"
+                
+                # Also force velocity sign to match trend
+                if override_trend == "RISING" and risk.get('glucose_velocity', 0) < 0:
+                    risk['glucose_velocity'] = abs(risk.get('glucose_velocity', 0))
+                elif override_trend == "FALLING" and risk.get('glucose_velocity', 0) > 0:
+                    risk['glucose_velocity'] = -abs(risk.get('glucose_velocity', 0))
         
         return risk, rules_triggered
 
-# ========== ========== FIX: ENGINE ADAPTER WITH CORRECT TYPE HANDLING ========== ==========
+# ========== ========== FIX: ENGINE ADAPTER WITH CORRECT SIGNATURE ========== ==========
 class EngineAdapter:
-    """Engine adapter that properly handles type conversion"""
+    """Engine adapter with correct signature for ClinicalOrchestrator.run()"""
     
     def __init__(self):
         self.config = Config()
@@ -397,99 +454,18 @@ class EngineAdapter:
         self._model_version = "v1.0"
     
     def predict(self, cgm_data: List[float], carbs: int, protein: int, fat: int) -> Dict:
-        """
-        Universal adapter that properly converts types before calling engine.
-        
-        CRITICAL FIX: Ensures all values are scalar floats, not dicts.
-        """
-        
-        # ========== CRITICAL: Convert to scalar floats ==========
-        # This prevents the "float() argument must be string or real number, not dict" error
-        cgm_array = np.array(cgm_data, dtype=np.float32)
-        carbs_float = float(carbs)
-        protein_float = float(protein)
-        fat_float = float(fat)
-        top_k_value = 10
-        
-        # Get the actual function signature
-        sig = inspect.signature(self.orchestrator.run)
-        params = list(sig.parameters.keys())
-        
-        # ========== Try different calling patterns ==========
+        """Call engine with correct signature: run(cgm_readings, carbs, protein, fat, top_k)"""
         try:
-            # Pattern 1: Check if 'cgm_readings' is a parameter (your engine's actual signature)
-            if 'cgm_readings' in params:
-                result = self.orchestrator.run(
-                    cgm_readings=cgm_array,
-                    carbs=carbs_float,
-                    protein=protein_float,
-                    fat=fat_float,
-                    top_k=top_k_value
-                )
-                self._signature_used = "cgm_readings_keyword"
-                return result
-            
-            # Pattern 2: Check if 'cgm' is a parameter
-            elif 'cgm' in params:
-                result = self.orchestrator.run(
-                    cgm=cgm_array,
-                    carbs=carbs_float,
-                    protein=protein_float,
-                    fat=fat_float,
-                    top_k=top_k_value
-                )
-                self._signature_used = "cgm_keyword"
-                return result
-            
-            # Pattern 3: Check if 'cgm_data' is a parameter
-            elif 'cgm_data' in params:
-                result = self.orchestrator.run(
-                    cgm_data=cgm_array,
-                    carbs=carbs_float,
-                    protein=protein_float,
-                    fat=fat_float,
-                    top_k=top_k_value
-                )
-                self._signature_used = "cgm_data_keyword"
-                return result
-            
-            # Pattern 4: Check if 'data' is a parameter
-            elif 'data' in params:
-                result = self.orchestrator.run(
-                    data=cgm_array,
-                    carbs=carbs_float,
-                    protein=protein_float,
-                    fat=fat_float,
-                    top_k=top_k_value
-                )
-                self._signature_used = "data_keyword"
-                return result
-            
-            # Pattern 5: Positional arguments (no parameter names)
-            elif len(params) >= 4:
-                result = self.orchestrator.run(
-                    cgm_array, carbs_float, protein_float, fat_float, top_k_value
-                )
-                self._signature_used = "positional"
-                return result
-            
-            else:
-                # Pattern 6: Single dict argument
-                result = self.orchestrator.run({
-                    "cgm_readings": cgm_array,
-                    "carbs": carbs_float,
-                    "protein": protein_float,
-                    "fat": fat_float,
-                    "top_k": top_k_value
-                })
-                self._signature_used = "dict_input"
-                return result
-                
-        except TypeError as e:
-            # Log the actual signature for debugging
-            st.error(f"Engine signature mismatch. Expected parameters: {params}")
-            st.error(f"Error: {str(e)}")
-            return {"error": f"engine_signature_mismatch: {str(e)}"}
+            # ========== CORRECT SIGNATURE: cgm_readings, carbs, protein, fat, top_k ==========
+            result = self.orchestrator.run(
+                cgm_readings=cgm_data,  # Note: cgm_readings, NOT cgm or cgm_data
+                carbs=carbs,
+                protein=protein,
+                fat=fat,
+                top_k=10
+            )
+            self._signature_used = "cgm_readings_keyword"
+            return result
         except Exception as e:
             st.error(f"Engine error: {str(e)}")
             return {"error": str(e)}
@@ -566,13 +542,24 @@ def get_pred(preds: Dict, key: str, sub: str, default: float = 0.0) -> float:
         return default
 
 def compute_velocity(cgm_data: List[float], model_velocity: Optional[float] = None) -> Tuple[float, float]:
+    """Compute velocity with correct sign"""
     computed_velocity = 0.0
     if cgm_data and len(cgm_data) >= 3:
         try:
-            time_diff = 2 * CGM_INTERVAL_MINUTES
+            # ========== CORRECT: (current - previous) / time ==========
+            time_diff = 2 * CGM_INTERVAL_MINUTES  # 10 minutes
             computed_velocity = (cgm_data[-1] - cgm_data[-3]) / time_diff
         except Exception:
             computed_velocity = 0.0
+    
+    # Safely handle dict-type model_velocity
+    if model_velocity is not None:
+        if isinstance(model_velocity, dict):
+            model_velocity = model_velocity.get("value", 0.0)
+        try:
+            model_velocity = float(model_velocity)
+        except (ValueError, TypeError):
+            model_velocity = 0.0
     
     if model_velocity is not None and abs(model_velocity) > 0.01:
         if abs(model_velocity) > 1.0:
@@ -1025,14 +1012,14 @@ def main():
         else:
             preds = preds_raw
         
-        # Velocity fusion
+        # Velocity fusion with dict safety
         model_velocity = risk.get('glucose_velocity')
         velocity, computed_velocity = compute_velocity(cgm_data, model_velocity)
         risk['glucose_velocity'] = velocity
         
         current = get_current_glucose(risk, result, cgm_data)
         
-        # Apply clinical rules
+        # ========== FIX: Apply clinical rules with correct priority ==========
         risk, rules_triggered = rule_engine.apply_rules(cgm_data, preds, risk)
         
         # Get updated risk level
@@ -1078,11 +1065,12 @@ def main():
         
         dominant_risk = risk.get('dominant_risk', 'NONE')
         clinical_summary = risk.get('clinical_summary', 'No summary available')
+        trend_direction = risk.get('trend_direction', 'STABLE')
         
         st.markdown(f"""
             <div class="{color_style}">
                 🚨 RISK: {risk_level} — {dominant_risk}
-                <br><small>{clinical_summary}</small>
+                <br><small>Trend: {trend_direction} | {clinical_summary}</small>
                 {f'<br><small>⚕️ {len(rules_triggered)} clinical rules triggered</small>' if rules_triggered else ''}
             </div>
         """, unsafe_allow_html=True)
@@ -1287,6 +1275,8 @@ def main():
                     {
                         'Time': entry['timestamp'],
                         'Risk': entry['risk'].get('risk_level', 'UNKNOWN'),
+                        'Dominant': entry['risk'].get('dominant_risk', 'NONE'),
+                        'Trend': entry['risk'].get('trend_direction', 'STABLE'),
                         'Velocity': entry.get('velocity', 0),
                         'Reliability': entry.get('reliability', {}).get('label', 'UNKNOWN'),
                         'Trust': entry.get('trust', {}).get('label', 'UNKNOWN'),
@@ -1303,6 +1293,7 @@ def main():
                             'Time': entry['timestamp'],
                             'Actionable': entry['actionable'],
                             'Risk': entry['risk_level'],
+                            'Dominant': entry.get('dominant_risk', 'NONE'),
                             'Rules': len(entry.get('rule_overrides', [])),
                             'Reasoning': entry['reasoning'][:100] + '...'
                         }
