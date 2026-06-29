@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Any, Tuple
 import hashlib
 import json
 import copy
+import inspect
 
 # Import from engine
 from engine import Config, ClinicalOrchestrator
@@ -42,12 +43,10 @@ st.markdown("""
         .confidence-high { color: #28a745; font-weight: bold; }
         .confidence-medium { color: #ffc107; font-weight: bold; }
         .confidence-low { color: #dc3545; font-weight: bold; }
-        .model-drift { background-color: #fff3cd; border-left: 4px solid #ffc107; padding: 10px; margin: 5px 0; border-radius: 4px; }
-        .clinical-rule { background-color: #d4edda; border-left: 4px solid #28a745; padding: 10px; margin: 5px 0; border-radius: 4px; }
     </style>
 """, unsafe_allow_html=True)
 
-# ========== ========== SCHEMA VALIDATION ========== ==========
+# ========== SCHEMA VALIDATION ==========
 def validate_engine_output(result: Any) -> Tuple[bool, str]:
     """Validate engine output has required structure"""
     if not result:
@@ -62,7 +61,7 @@ def validate_engine_output(result: Any) -> Tuple[bool, str]:
     
     return True, "Valid"
 
-# ========== ========== CLINICAL REASONING ENGINE ========== ==========
+# ========== CLINICAL REASONING ENGINE ==========
 class ClinicalReasoningEngine:
     """Separate clinical reasoning engine with uncertainty awareness"""
     
@@ -153,7 +152,7 @@ class ClinicalReasoningEngine:
             'history': self.reasoning_history
         }
 
-# ========== ========== PREDICTION AUDIT ========== ==========
+# ========== PREDICTION AUDIT ==========
 class PredictionAudit:
     """Single source of truth for audit trail"""
     
@@ -178,30 +177,23 @@ class PredictionAudit:
             'clinical_rules': clinical_rules or []
         }
         self._log.append(entry)
-        # ========== FIX 2: Single source of truth ==========
-        # Update session state from class
         st.session_state['prediction_audit'] = self._log.copy()
     
     def get_last(self) -> Optional[Dict]:
-        """Get most recent prediction"""
         return self._log[-1] if self._log else None
     
     def get_history(self) -> List[Dict]:
-        """Get full audit history"""
         return self._log.copy()
     
     def export_audit(self) -> str:
-        """Export audit trail as JSON"""
         return json.dumps(self._log, default=str, indent=2)
     
     def clear(self):
-        """Clear audit history"""
         self._log = []
         st.session_state['prediction_audit'] = []
 
-# ========== ========== RISK NORMALIZER ========== ==========
+# ========== RISK NORMALIZER ==========
 class RiskNormalizer:
-    """Normalize risk output without mutation"""
     @staticmethod
     def normalize(risk: Any) -> Dict:
         default = {
@@ -265,12 +257,10 @@ class RiskNormalizer:
             return "UNKNOWN"
         return mapping[level]
 
-# ========== ========== PREDICTION NORMALIZER ========== ==========
+# ========== PREDICTION NORMALIZER ==========
 class PredictionNormalizer:
-    """Normalize predictions with validation flag"""
     @staticmethod
     def normalize(preds: Any) -> Tuple[Optional[Dict], bool]:
-        """Normalize predictions and return validity flag"""
         default = {
             '30min': {'mean': 0.0, 'lower': 0.0, 'upper': 0.0},
             '60min': {'mean': 0.0, 'lower': 0.0, 'upper': 0.0},
@@ -280,7 +270,6 @@ class PredictionNormalizer:
         if not isinstance(preds, dict):
             return None, False
         
-        # Check if any values are actually valid
         has_valid_values = False
         normalized = copy.deepcopy(default)
         is_valid = True
@@ -302,21 +291,19 @@ class PredictionNormalizer:
                             normalized[k][sub] = default[k][sub]
                         else:
                             normalized[k][sub] = value
-                            if abs(value) > 0.01:  # Has meaningful value
+                            if abs(value) > 0.01:
                                 has_valid_values = True
                     except (ValueError, TypeError):
                         is_valid = False
                         normalized[k][sub] = default[k][sub]
         
-        # ========== FIX 4: Return None if no valid predictions ==========
         if not has_valid_values:
             return None, False
         
         return normalized, is_valid
 
-# ========== ========== CLINICAL GUARD ========== ==========
+# ========== CLINICAL GUARD ==========
 class ClinicalGuard:
-    """Clinical safety guard"""
     @staticmethod
     def normalize_activity(activity: Any) -> Dict:
         defaults = {
@@ -351,13 +338,10 @@ class ClinicalGuard:
     def normalize_meal_plan(meal_plan: Any) -> Dict:
         return meal_plan if isinstance(meal_plan, dict) else {}
 
-# ========== ========== CLINICAL RULE ENGINE ========== ==========
+# ========== CLINICAL RULE ENGINE ==========
 class ClinicalRuleEngine:
-    """Hard safety rules that override model output"""
-    
     @staticmethod
     def apply_rules(cgm_data: List[float], preds: Dict, risk: Dict) -> Tuple[Dict, List[str]]:
-        """Apply clinical safety rules and return overridden risk + rule messages"""
         if not cgm_data or len(cgm_data) == 0:
             return risk, []
         
@@ -365,23 +349,19 @@ class ClinicalRuleEngine:
         rules_triggered = []
         override_risk = None
         
-        # Rule 1: Hypoglycemia override
         if current < HYPO_THRESHOLD:
             override_risk = "HIGH"
             rules_triggered.append(f"🚨 CLINICAL RULE: Current glucose {current:.0f} mg/dL below {HYPO_THRESHOLD:.0f} mg/dL threshold - HIGH risk override")
         
-        # Rule 2: Severe hypoglycemia
         if current < 55:
             override_risk = "HIGH"
             rules_triggered.append(f"🚨 CRITICAL RULE: Current glucose {current:.0f} mg/dL - SEVERE hypoglycemia")
         
-        # Rule 3: Hyperglycemia override
         if current > HYPER_THRESHOLD:
             if override_risk is None or override_risk == "LOW":
                 override_risk = "HIGH"
             rules_triggered.append(f"⚠️ CLINICAL RULE: Current glucose {current:.0f} mg/dL above {HYPER_THRESHOLD:.0f} mg/dL threshold - HIGH risk override")
         
-        # Rule 4: Rapid fall detection
         if len(cgm_data) >= 3:
             fall = cgm_data[-1] - cgm_data[-3]
             if fall < -30:
@@ -389,7 +369,6 @@ class ClinicalRuleEngine:
                     override_risk = "MEDIUM"
                 rules_triggered.append(f"⚠️ CLINICAL RULE: Rapid fall of {abs(fall):.0f} mg/dL detected - MEDIUM risk override")
         
-        # Rule 5: Rapid rise detection
         if len(cgm_data) >= 3:
             rise = cgm_data[-1] - cgm_data[-3]
             if rise > 40:
@@ -397,7 +376,6 @@ class ClinicalRuleEngine:
                     override_risk = "MEDIUM"
                 rules_triggered.append(f"⚠️ CLINICAL RULE: Rapid rise of {rise:.0f} mg/dL detected - MEDIUM risk override")
         
-        # Apply override
         if override_risk is not None:
             model_risk = risk.get('risk_level', 'LOW')
             risk_priority = {'HIGH': 3, 'MEDIUM': 2, 'LOW': 1, 'UNKNOWN': 0}
@@ -408,9 +386,9 @@ class ClinicalRuleEngine:
         
         return risk, rules_triggered
 
-# ========== ========== ENGINE ADAPTER ========== ==========
+# ========== ========== FIX: ENGINE ADAPTER WITH CORRECT SIGNATURE ========== ==========
 class EngineAdapter:
-    """Strict engine adapter with model versioning"""
+    """Engine adapter that automatically detects and matches the correct signature"""
     
     def __init__(self):
         self.config = Config()
@@ -419,22 +397,77 @@ class EngineAdapter:
         self._model_version = "v1.0"
     
     def predict(self, cgm_data: List[float], carbs: int, protein: int, fat: int) -> Dict:
-        """Standardized prediction interface"""
+        """Universal adapter that tries multiple signature patterns"""
+        
+        # Prepare inputs
+        cgm_array = np.array(cgm_data, dtype=np.float32)
+        meal_context = {
+            "carbs": carbs,
+            "protein": protein,
+            "fat": fat
+        }
+        top_k_value = 10
+        
+        # Get the actual function signature
+        sig = inspect.signature(self.orchestrator.run)
+        params = list(sig.parameters.keys())
+        
+        # Try different calling patterns based on parameter names
         try:
-            result = self.orchestrator.run(
-                cgm=np.array(cgm_data, dtype=np.float32),
-                meal_context={
-                    "carbs": carbs,
-                    "protein": protein,
-                    "fat": fat
-                },
-                top_k=10
-            )
-            self._signature_used = "standard"
-            return result
+            # Pattern 1: Check if 'cgm' is a parameter
+            if 'cgm' in params:
+                result = self.orchestrator.run(
+                    cgm=cgm_array,
+                    meal_context=meal_context,
+                    top_k=top_k_value
+                )
+                self._signature_used = "cgm_keyword"
+                return result
+            
+            # Pattern 2: Check if 'cgm_data' is a parameter
+            elif 'cgm_data' in params:
+                result = self.orchestrator.run(
+                    cgm_data=cgm_array,
+                    meal_context=meal_context,
+                    top_k=top_k_value
+                )
+                self._signature_used = "cgm_data_keyword"
+                return result
+            
+            # Pattern 3: Check if 'data' is a parameter
+            elif 'data' in params:
+                result = self.orchestrator.run(
+                    data=cgm_array,
+                    context=meal_context,
+                    k=top_k_value
+                )
+                self._signature_used = "data_keyword"
+                return result
+            
+            # Pattern 4: Positional arguments (no parameter names)
+            elif len(params) >= 2:
+                # Try positional: run(cgm_array, meal_context, top_k)
+                result = self.orchestrator.run(cgm_array, meal_context, top_k_value)
+                self._signature_used = "positional"
+                return result
+            
+            else:
+                # Pattern 5: Single dict argument
+                result = self.orchestrator.run({
+                    "cgm": cgm_array,
+                    "meal_context": meal_context,
+                    "top_k": top_k_value
+                })
+                self._signature_used = "dict_input"
+                return result
+                
         except TypeError as e:
+            # Log the actual signature for debugging
+            st.error(f"Engine signature mismatch. Expected parameters: {params}")
+            st.error(f"Error: {str(e)}")
             return {"error": f"engine_signature_mismatch: {str(e)}"}
         except Exception as e:
+            st.error(f"Engine error: {str(e)}")
             return {"error": str(e)}
     
     def get_signature(self) -> str:
@@ -446,7 +479,6 @@ class EngineAdapter:
 # ========== HELPER FUNCTIONS ==========
 
 def compute_input_hash(cgm_data: List[float], carbs: int, protein: int, fat: int) -> str:
-    """Compute stable hash of current input state"""
     if not cgm_data:
         return hashlib.md5("empty".encode()).hexdigest()
     cgm_str = ",".join([f"{x:.2f}" for x in cgm_data])
@@ -454,7 +486,6 @@ def compute_input_hash(cgm_data: List[float], carbs: int, protein: int, fat: int
     return hashlib.md5(input_str.encode()).hexdigest()
 
 def safe_last_value(data: List[float], default: float = 120.0) -> float:
-    """Safely get last value from list"""
     if data and len(data) > 0:
         try:
             return float(data[-1])
@@ -463,11 +494,9 @@ def safe_last_value(data: List[float], default: float = 120.0) -> float:
     return default
 
 def generate_sample_cgm_fixed() -> List[float]:
-    """Generate a fixed sample for consistency"""
     return [120, 122, 118, 121, 125, 128, 130, 135, 132, 129]
 
 def validate_cgm_data(data: List[float], required_length: int = REQUIRED_READINGS) -> Tuple[bool, str]:
-    """Validate CGM data with strict checking"""
     if not data or len(data) == 0:
         return False, "No data provided"
     if len(data) != required_length:
@@ -486,7 +515,6 @@ def validate_cgm_data(data: List[float], required_length: int = REQUIRED_READING
     return True, "Valid"
 
 def validate_predictions(pred_means: List[float]) -> bool:
-    """Validate predictions are numeric and within clinical range"""
     if not pred_means:
         return False
     try:
@@ -500,7 +528,6 @@ def validate_predictions(pred_means: List[float]) -> bool:
         return False
 
 def get_pred(preds: Dict, key: str, sub: str, default: float = 0.0) -> float:
-    """Safely get prediction value"""
     if not preds or not isinstance(preds, dict):
         return default
     pred_key = preds.get(key)
@@ -514,10 +541,7 @@ def get_pred(preds: Dict, key: str, sub: str, default: float = 0.0) -> float:
     except (ValueError, TypeError):
         return default
 
-# ========== ========== VELOCITY FUSION ========== ==========
 def compute_velocity(cgm_data: List[float], model_velocity: Optional[float] = None) -> Tuple[float, float]:
-    """Compute velocity with adaptive fusion"""
-    # Compute from CGM
     computed_velocity = 0.0
     if cgm_data and len(cgm_data) >= 3:
         try:
@@ -526,22 +550,17 @@ def compute_velocity(cgm_data: List[float], model_velocity: Optional[float] = No
         except Exception:
             computed_velocity = 0.0
     
-    # ========== FIX 6: Adaptive velocity fusion ==========
     if model_velocity is not None and abs(model_velocity) > 0.01:
-        # Weight based on model signal strength
         if abs(model_velocity) > 1.0:
-            alpha = 0.4  # More weight to model for strong signals
+            alpha = 0.4
         else:
-            alpha = 0.6  # More weight to computed for weak signals
-        
+            alpha = 0.6
         fused = alpha * computed_velocity + (1 - alpha) * model_velocity
         return fused, computed_velocity
     else:
         return computed_velocity, computed_velocity
 
-# ========== ========== TRUST SCORE ========== ==========
 def compute_trust_score(model_velocity: float, computed_velocity: float) -> Dict:
-    """Compute model trust score based on velocity agreement"""
     if abs(model_velocity) < 0.01 and abs(computed_velocity) < 0.01:
         return {'score': 1.0, 'label': 'HIGH', 'message': 'Model agrees: stable glucose'}
     
@@ -556,9 +575,7 @@ def compute_trust_score(model_velocity: float, computed_velocity: float) -> Dict
     else:
         return {'score': agreement, 'label': 'LOW', 'message': '⚠️ Model drift detected'}
 
-# ========== ========== RELIABILITY ========== ==========
 def compute_reliability_score(preds: Dict, horizon: str = '30min') -> Dict:
-    """Compute prediction reliability based on uncertainty"""
     try:
         if not preds or not isinstance(preds, dict):
             return {'score': 0.0, 'label': 'INVALID', 'color': 'confidence-low'}
@@ -590,14 +607,10 @@ def compute_reliability_score(preds: Dict, horizon: str = '30min') -> Dict:
     except:
         return {'score': 0.0, 'label': 'INVALID', 'color': 'confidence-low'}
 
-# ========== ========== CI BOUNDS ========== ==========
 def safe_ci_bounds(mean: float, lower: float, upper: float) -> Tuple[float, float]:
-    """Ensure CI bounds are physically meaningful"""
-    # ========== FIX 7: Only clamp to physiological range ==========
     lower = max(lower, CGM_MIN)
     upper = min(upper, CGM_MAX)
     
-    # Ensure lower <= mean <= upper
     if lower > mean:
         lower = mean - 1
     if upper < mean:
@@ -605,9 +618,7 @@ def safe_ci_bounds(mean: float, lower: float, upper: float) -> Tuple[float, floa
     
     return lower, upper
 
-# ========== ANOMALY DETECTION ==========
 def detect_anomalies(cgm_data: List[float]) -> List[Dict]:
-    """Detect anomalies in CGM data"""
     anomalies = []
     if not cgm_data or len(cgm_data) < 3:
         return anomalies
@@ -642,7 +653,6 @@ def detect_anomalies(cgm_data: List[float]) -> List[Dict]:
     return anomalies
 
 def get_current_glucose(risk: Dict, result: Dict, cgm_data: List[float]) -> float:
-    """Get current glucose with clear priority hierarchy"""
     if risk and risk.get('current') is not None:
         return float(risk['current'])
     if result and result.get('current_glucose') is not None:
@@ -650,7 +660,6 @@ def get_current_glucose(risk: Dict, result: Dict, cgm_data: List[float]) -> floa
     return safe_last_value(cgm_data)
 
 def handle_unknown_risk(risk_level: str) -> None:
-    """Handle UNKNOWN risk level with explicit warning"""
     if risk_level == "UNKNOWN":
         st.error("⚠️ MODEL UNCERTAINTY: Risk level is unknown - clinical interpretation unreliable")
         st.warning("Check engine output or data quality before making clinical decisions")
@@ -658,7 +667,6 @@ def handle_unknown_risk(risk_level: str) -> None:
 # ========== PLOTTING ==========
 def plot_predictions(cgm_data: List[float], preds: Dict, current: float, 
                     preds_valid: bool = True, rules_triggered: List[str] = None):
-    """Plot CGM data with predictions"""
     if not cgm_data or len(cgm_data) == 0:
         fig = go.Figure()
         fig.add_annotation(text="No data available", xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
@@ -967,7 +975,6 @@ def main():
                 st.session_state.analyze = False
                 st.stop()
             
-            # ========== FIX 10: Schema validation ==========
             is_valid, msg = validate_engine_output(result)
             if not is_valid:
                 st.error(f"Invalid engine output: {msg}")
@@ -978,7 +985,7 @@ def main():
         risk = RiskNormalizer.normalize(result.get('risk') or {})
         preds_raw, preds_valid = PredictionNormalizer.normalize(result.get('predictions'))
         
-        # ========== FIX 1: Extract all required variables ==========
+        # Extract all required variables
         food_recs = ClinicalGuard.normalize_food_recs(result.get('food_recommendations'))
         activity = ClinicalGuard.normalize_activity(result.get('activity'))
         meal_plan = ClinicalGuard.normalize_meal_plan(result.get('meal_plan'))
@@ -994,17 +1001,17 @@ def main():
         else:
             preds = preds_raw
         
-        # ========== FIX 6: Velocity fusion ==========
+        # Velocity fusion
         model_velocity = risk.get('glucose_velocity')
         velocity, computed_velocity = compute_velocity(cgm_data, model_velocity)
         risk['glucose_velocity'] = velocity
         
         current = get_current_glucose(risk, result, cgm_data)
         
-        # ========== FIX 8: Apply clinical rules ==========
+        # Apply clinical rules
         risk, rules_triggered = rule_engine.apply_rules(cgm_data, preds, risk)
         
-        # ========== FIX 3: Get updated risk level ==========
+        # Get updated risk level
         risk_level = risk.get('risk_level', 'LOW')
         
         if rules_triggered:
@@ -1024,7 +1031,7 @@ def main():
         )
         st.session_state.reasoning_history = reasoning['history']
         
-        # ========== FIX 5: Single source of truth for audit ==========
+        # Audit
         audit.log_prediction(
             cgm_data, preds, risk, velocity, reliability, trust,
             engine.get_signature(), engine.get_model_version(),
