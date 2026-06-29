@@ -1,7 +1,7 @@
 # ============================================================
 # VERCEL-OPTIMIZED engine.py - Complete Single File
-# All models in project root (no separate folders)
-# Deploy directly to Vercel as a Serverless Function
+# Serves both API endpoints and beautiful frontend UI
+# All files in project root - NO subfolders
 # ============================================================
 
 import numpy as np
@@ -12,7 +12,8 @@ import json
 from datetime import datetime
 from typing import Dict, Tuple, List, Optional
 from dataclasses import dataclass
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 import uvicorn
 
@@ -26,7 +27,6 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 @dataclass
 class Config:
     DATA_PATH: str = BASE_DIR
-    # All model files in project root (no subfolders)
     FEATURE_SCALER_FILE: str = os.path.join(BASE_DIR, "feature_scaler.pkl")
     GLUCOSE_SCALER_FILE: str = os.path.join(BASE_DIR, "glucose_scaler.pkl")
     LSTM_MODEL_FILE: str = os.path.join(BASE_DIR, "lstm_encoder_trained.pth")
@@ -545,7 +545,6 @@ class PredictionEngine:
             return
         
         try:
-            # Lazy imports - only imported when needed
             import torch
             import joblib
             import torch.nn as nn
@@ -670,8 +669,8 @@ class PredictionEngine:
             return raw.copy()
 
     def predict_glucose(self, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        import torch  # Lazy import
-        self._load_models()  # Ensure models are loaded
+        import torch
+        self._load_models()
         
         if len(x.shape) == 2:
             x = x[np.newaxis, :, :]
@@ -946,8 +945,6 @@ class PredictionEngine:
 # CLINICAL ORCHESTRATOR
 # ============================================================
 class ClinicalOrchestrator:
-    """Main orchestrator with singleton pattern for Vercel"""
-    
     _instance = None
     _initialized = False
     
@@ -964,10 +961,8 @@ class ClinicalOrchestrator:
             config = Config()
         self.config = config
         
-        # Lazy-load prediction engine (singleton)
         self._prediction_engine = PredictionEngine(config)
         
-        # Load food DB from project root
         if not os.path.exists(config.FOOD_DB_FILE):
             raise FileNotFoundError(f"Missing food database: {config.FOOD_DB_FILE}")
         self.food_df = load_food_database(config.FOOD_DB_FILE)
@@ -1062,7 +1057,6 @@ class ClinicalOrchestrator:
 _ENGINE = None
 
 def get_engine() -> ClinicalOrchestrator:
-    """Get the singleton engine instance (creates on first call)"""
     global _ENGINE
     if _ENGINE is None:
         config = Config()
@@ -1071,9 +1065,9 @@ def get_engine() -> ClinicalOrchestrator:
 
 
 # ============================================================
-# FASTAPI APP (Vercel entry point)
+# FASTAPI APP WITH FRONTEND UI
 # ============================================================
-app = FastAPI()
+app = FastAPI(title="GlucoseGuard CDSS", description="Clinical Decision Support System")
 
 class PredictionRequest(BaseModel):
     cgm_readings: List[float]
@@ -1082,9 +1076,11 @@ class PredictionRequest(BaseModel):
     fat: Optional[float] = 0.0
     top_k: Optional[int] = 10
 
+# ============================================================
+# API ENDPOINTS
+# ============================================================
 @app.post("/api/predict")
 async def predict(request: PredictionRequest):
-    """Main prediction endpoint for Vercel"""
     try:
         engine = get_engine()
         result = engine.run(
@@ -1102,32 +1098,578 @@ async def predict(request: PredictionRequest):
 async def health():
     return {"status": "healthy", "models_loaded": _ENGINE is not None}
 
-# For local testing
-@app.get("/")
-async def root():
-    return {"message": "CDSS API is running", "endpoints": ["/api/predict", "/api/health"]}
+# ============================================================
+# FRONTEND UI - Beautiful HTML Interface
+# ============================================================
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GlucoseGuard CDSS</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: rgba(255,255,255,0.95);
+            border-radius: 20px;
+            padding: 30px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+        h1 {
+            color: #333;
+            font-size: 2.5em;
+            margin-bottom: 10px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .subtitle {
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 1.1em;
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        @media (max-width: 768px) {
+            .grid { grid-template-columns: 1fr; }
+        }
+        .card {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 12px;
+            border: 1px solid #e9ecef;
+        }
+        .card h3 {
+            color: #495057;
+            margin-bottom: 15px;
+            font-size: 1.1em;
+        }
+        .slider-group {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+        }
+        .slider-item {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .slider-item label {
+            font-size: 0.8em;
+            color: #666;
+            margin-bottom: 2px;
+        }
+        .slider-item input[type="range"] {
+            width: 100%;
+            height: 6px;
+            -webkit-appearance: none;
+            background: #667eea;
+            border-radius: 3px;
+            outline: none;
+        }
+        .slider-item input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 16px;
+            height: 16px;
+            background: #764ba2;
+            border-radius: 50%;
+            cursor: pointer;
+        }
+        .slider-value {
+            font-size: 0.9em;
+            font-weight: bold;
+            color: #333;
+            margin-top: 2px;
+        }
+        .presets {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            margin-top: 10px;
+        }
+        .preset-btn {
+            padding: 8px;
+            border: 1px solid #dee2e6;
+            border-radius: 6px;
+            background: white;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-size: 0.9em;
+        }
+        .preset-btn:hover {
+            background: #667eea;
+            color: white;
+            border-color: #667eea;
+        }
+        .meal-input {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 10px;
+            margin-top: 10px;
+        }
+        .meal-input input {
+            padding: 8px 12px;
+            border: 1px solid #dee2e6;
+            border-radius: 6px;
+            font-size: 1em;
+            width: 100%;
+        }
+        .analyze-btn {
+            width: 100%;
+            padding: 15px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 12px;
+            font-size: 1.2em;
+            font-weight: bold;
+            cursor: pointer;
+            transition: transform 0.2s;
+            margin-top: 20px;
+        }
+        .analyze-btn:hover {
+            transform: translateY(-2px);
+        }
+        .analyze-btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+        .results {
+            display: none;
+            margin-top: 30px;
+            border-top: 2px solid #e9ecef;
+            padding-top: 30px;
+        }
+        .results.show {
+            display: block;
+        }
+        .risk-banner {
+            padding: 20px;
+            border-radius: 12px;
+            margin-bottom: 20px;
+            font-size: 1.2em;
+            font-weight: bold;
+        }
+        .risk-high { background: #dc3545; color: white; }
+        .risk-medium { background: #ffc107; color: #000; }
+        .risk-low { background: #28a745; color: white; }
+        .metrics {
+            display: grid;
+            grid-template-columns: repeat(5, 1fr);
+            gap: 10px;
+            margin: 20px 0;
+        }
+        @media (max-width: 768px) {
+            .metrics { grid-template-columns: repeat(3, 1fr); }
+        }
+        .metric {
+            background: #f8f9fa;
+            padding: 12px;
+            border-radius: 8px;
+            text-align: center;
+            border: 1px solid #e9ecef;
+        }
+        .metric .label { font-size: 0.8em; color: #666; }
+        .metric .value { font-size: 1.3em; font-weight: bold; color: #333; }
+        .metric .delta { font-size: 0.8em; }
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin: 20px 0;
+            border-bottom: 2px solid #e9ecef;
+        }
+        .tab {
+            padding: 10px 20px;
+            cursor: pointer;
+            border-bottom: 3px solid transparent;
+            transition: all 0.2s;
+        }
+        .tab.active {
+            border-bottom-color: #667eea;
+            color: #667eea;
+            font-weight: bold;
+        }
+        .tab-content {
+            display: none;
+            padding: 20px 0;
+        }
+        .tab-content.active {
+            display: block;
+        }
+        .table-wrap {
+            overflow-x: auto;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        th, td {
+            padding: 10px;
+            text-align: left;
+            border-bottom: 1px solid #e9ecef;
+        }
+        th {
+            background: #f1f3f5;
+            font-weight: 600;
+        }
+        .loading {
+            text-align: center;
+            padding: 40px;
+            display: none;
+        }
+        .loading.show {
+            display: block;
+        }
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #667eea;
+            border-radius: 50%;
+            width: 50px;
+            height: 50px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .error {
+            background: #f8d7da;
+            color: #721c24;
+            padding: 15px;
+            border-radius: 8px;
+            margin: 10px 0;
+            display: none;
+        }
+        .error.show {
+            display: block;
+        }
+        .summary-text {
+            background: #d4edda;
+            padding: 15px;
+            border-radius: 8px;
+            margin: 10px 0;
+            border-left: 4px solid #28a745;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🩺 GlucoseGuard CDSS</h1>
+        <div class="subtitle">Clinical Decision Support System for Diabetes Management</div>
+        
+        <div class="grid">
+            <div class="card">
+                <h3>📊 CGM Readings (10 values)</h3>
+                <div class="slider-group" id="sliders"></div>
+                <div class="presets">
+                    <button class="preset-btn" onclick="loadPreset('normal')">📊 Normal</button>
+                    <button class="preset-btn" onclick="loadPreset('rising')">📈 Rising</button>
+                    <button class="preset-btn" onclick="loadPreset('falling')">📉 Falling</button>
+                    <button class="preset-btn" onclick="loadPreset('spike')">🎯 Spike</button>
+                </div>
+            </div>
+            <div class="card">
+                <h3>🍽️ Meal Context</h3>
+                <div class="meal-input">
+                    <div>
+                        <label>Carbs (g)</label>
+                        <input type="number" id="carbs" value="0" min="0" max="200">
+                    </div>
+                    <div>
+                        <label>Protein (g)</label>
+                        <input type="number" id="protein" value="0" min="0" max="100">
+                    </div>
+                    <div>
+                        <label>Fat (g)</label>
+                        <input type="number" id="fat" value="0" min="0" max="100">
+                    </div>
+                </div>
+                <button class="analyze-btn" onclick="analyze()">🚀 Analyze</button>
+            </div>
+        </div>
+        
+        <div id="loading" class="loading">
+            <div class="spinner"></div>
+            <p>Analyzing glucose data...</p>
+        </div>
+        
+        <div id="error" class="error"></div>
+        
+        <div id="results" class="results">
+            <div id="riskBanner" class="risk-banner"></div>
+            
+            <div class="metrics" id="metrics"></div>
+            
+            <div class="summary-text" id="summary"></div>
+            
+            <div class="tabs">
+                <div class="tab active" onclick="switchTab('details')">📊 Details</div>
+                <div class="tab" onclick="switchTab('food')">🍽️ Food</div>
+                <div class="tab" onclick="switchTab('activity')">🏃 Activity</div>
+            </div>
+            
+            <div id="tab-details" class="tab-content active">
+                <div id="detailsContent"></div>
+            </div>
+            <div id="tab-food" class="tab-content">
+                <div id="foodContent"></div>
+            </div>
+            <div id="tab-activity" class="tab-content">
+                <div id="activityContent"></div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // Preset data
+        const PRESETS = {
+            normal: [120, 122, 118, 121, 125, 128, 130, 135, 132, 129],
+            rising: [120, 125, 130, 135, 140, 145, 150, 155, 160, 165],
+            falling: [180, 175, 170, 165, 160, 155, 150, 145, 140, 135],
+            spike: [120, 122, 118, 130, 165, 180, 175, 160, 145, 130]
+        };
+        
+        let currentData = [...PRESETS.normal];
+        
+        // Initialize sliders
+        function initSliders() {
+            const container = document.getElementById('sliders');
+            container.innerHTML = '';
+            for (let i = 0; i < 10; i++) {
+                const div = document.createElement('div');
+                div.className = 'slider-item';
+                div.innerHTML = `
+                    <label>#${i+1}</label>
+                    <input type="range" min="40" max="250" value="${currentData[i]}" 
+                           oninput="updateSlider(${i}, this.value)">
+                    <span class="slider-value" id="val-${i}">${currentData[i]}</span>
+                `;
+                container.appendChild(div);
+            }
+        }
+        
+        function updateSlider(idx, val) {
+            currentData[idx] = parseInt(val);
+            document.getElementById(`val-${idx}`).textContent = val;
+        }
+        
+        function loadPreset(name) {
+            const data = PRESETS[name];
+            if (!data) return;
+            currentData = [...data];
+            for (let i = 0; i < 10; i++) {
+                const slider = document.querySelector(`#sliders .slider-item:nth-child(${i+1}) input`);
+                if (slider) {
+                    slider.value = data[i];
+                    document.getElementById(`val-${i}`).textContent = data[i];
+                }
+            }
+        }
+        
+        function switchTab(tab) {
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+            document.querySelector(`.tab[onclick="switchTab('${tab}')"]`).classList.add('active');
+            document.getElementById(`tab-${tab}`).classList.add('active');
+        }
+        
+        async function analyze() {
+            const loading = document.getElementById('loading');
+            const results = document.getElementById('results');
+            const error = document.getElementById('error');
+            
+            loading.classList.add('show');
+            results.classList.remove('show');
+            error.classList.remove('show');
+            
+            const carbs = parseInt(document.getElementById('carbs').value) || 0;
+            const protein = parseInt(document.getElementById('protein').value) || 0;
+            const fat = parseInt(document.getElementById('fat').value) || 0;
+            
+            const payload = {
+                cgm_readings: currentData,
+                carbs: carbs,
+                protein: protein,
+                fat: fat,
+                top_k: 10
+            };
+            
+            try {
+                const response = await fetch('/api/predict', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                
+                const result = await response.json();
+                
+                if (!response.ok || result.status !== 'success') {
+                    throw new Error(result.detail || 'Analysis failed');
+                }
+                
+                displayResults(result.data);
+                loading.classList.remove('show');
+                results.classList.add('show');
+                
+            } catch (err) {
+                loading.classList.remove('show');
+                error.textContent = '❌ ' + err.message;
+                error.classList.add('show');
+            }
+        }
+        
+        function displayResults(data) {
+            const risk = data.risk || {};
+            const preds = data.predictions || {};
+            const food = data.food_recommendations || [];
+            const mealPlan = data.meal_plan || {};
+            const activity = data.activity || {};
+            
+            const riskLevel = risk.risk_level || 'LOW';
+            const dominant = risk.dominant_risk || 'NONE';
+            const summary = risk.clinical_summary || 'No summary';
+            const current = risk.current || 0;
+            const velocity = risk.glucose_velocity || 0;
+            
+            // Risk banner
+            const banner = document.getElementById('riskBanner');
+            banner.className = `risk-banner risk-${riskLevel.toLowerCase()}`;
+            banner.innerHTML = `🚨 RISK: ${riskLevel} — ${dominant}<br><small>Trend: ${risk.trend_direction || 'STABLE'}</small>`;
+            
+            // Metrics
+            const metricsHtml = `
+                <div class="metric"><div class="label">Current</div><div class="value">${current.toFixed(0)} mg/dL</div></div>
+                <div class="metric"><div class="label">30-min</div><div class="value">${(preds['30min']?.mean || 0).toFixed(0)}</div><div class="delta">${((preds['30min']?.mean || 0) - current).toFixed(0)}</div></div>
+                <div class="metric"><div class="label">60-min</div><div class="value">${(preds['60min']?.mean || 0).toFixed(0)}</div><div class="delta">${((preds['60min']?.mean || 0) - current).toFixed(0)}</div></div>
+                <div class="metric"><div class="label">120-min</div><div class="value">${(preds['120min']?.mean || 0).toFixed(0)}</div><div class="delta">${((preds['120min']?.mean || 0) - current).toFixed(0)}</div></div>
+                <div class="metric"><div class="label">Velocity</div><div class="value">${velocity.toFixed(2)}</div></div>
+            `;
+            document.getElementById('metrics').innerHTML = metricsHtml;
+            
+            // Summary
+            document.getElementById('summary').textContent = '🧠 ' + summary;
+            
+            // Details tab
+            const detailsHtml = `
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;">
+                    <div>
+                        <h4>Prediction Details</h4>
+                        <table>
+                            <tr><th>Horizon</th><th>Mean</th><th>Lower</th><th>Upper</th></tr>
+                            <tr><td>30 min</td><td>${(preds['30min']?.mean || 0).toFixed(1)}</td><td>${(preds['30min']?.lower || 0).toFixed(1)}</td><td>${(preds['30min']?.upper || 0).toFixed(1)}</td></tr>
+                            <tr><td>60 min</td><td>${(preds['60min']?.mean || 0).toFixed(1)}</td><td>${(preds['60min']?.lower || 0).toFixed(1)}</td><td>${(preds['60min']?.upper || 0).toFixed(1)}</td></tr>
+                            <tr><td>120 min</td><td>${(preds['120min']?.mean || 0).toFixed(1)}</td><td>${(preds['120min']?.lower || 0).toFixed(1)}</td><td>${(preds['120min']?.upper || 0).toFixed(1)}</td></tr>
+                        </table>
+                    </div>
+                    <div>
+                        <h4>Risk Metrics</h4>
+                        <table>
+                            <tr><td>Peak</td><td>${(risk.peak || 0).toFixed(0)} mg/dL</td></tr>
+                            <tr><td>Trough</td><td>${(risk.trough || 0).toFixed(0)} mg/dL</td></tr>
+                            <tr><td>Risk Score</td><td>${(risk.risk_score || 0).toFixed(2)}</td></tr>
+                            <tr><td>Requires Action</td><td>${risk.requires_action ? '✅ Yes' : '❌ No'}</td></tr>
+                        </table>
+                    </div>
+                </div>
+            `;
+            document.getElementById('detailsContent').innerHTML = detailsHtml;
+            
+            // Food tab
+            let foodHtml = '<h4>Top Food Recommendations</h4>';
+            if (food && food.length > 0) {
+                foodHtml += '<div class="table-wrap"><table><tr>';
+                const headers = Object.keys(food[0]);
+                headers.forEach(h => foodHtml += `<th>${h}</th>`);
+                foodHtml += '</tr>';
+                food.forEach(item => {
+                    foodHtml += '<tr>';
+                    headers.forEach(h => foodHtml += `<td>${item[h] || ''}</td>`);
+                    foodHtml += '</tr>';
+                });
+                foodHtml += '</table></div>';
+                
+                if (Object.keys(mealPlan).length > 0) {
+                    foodHtml += '<h4 style="margin-top:20px;">🥗 Meal Plan</h4>';
+                    for (const [meal, items] of Object.entries(mealPlan)) {
+                        if (items && items.length > 0) {
+                            foodHtml += `<h5>${meal}</h5><div class="table-wrap"><table><tr>`;
+                            const h = Object.keys(items[0]);
+                            h.forEach(k => foodHtml += `<th>${k}</th>`);
+                            foodHtml += '</tr>';
+                            items.forEach(item => {
+                                foodHtml += '<tr>';
+                                h.forEach(k => foodHtml += `<td>${item[k] || ''}</td>`);
+                                foodHtml += '</tr>';
+                            });
+                            foodHtml += '</table></div>';
+                        }
+                    }
+                }
+            } else {
+                foodHtml += '<p>No food recommendations available</p>';
+            }
+            document.getElementById('foodContent').innerHTML = foodHtml;
+            
+            // Activity tab
+            const activityHtml = `
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;">
+                    <div>
+                        <p><strong>Activity:</strong> ${activity.activity || 'N/A'}</p>
+                        <p><strong>Duration:</strong> ${activity.duration || 'N/A'}</p>
+                        <p><strong>Timing:</strong> ${activity.timing || 'N/A'}</p>
+                    </div>
+                    <div>
+                        <p><strong>Intensity:</strong> ${activity.intensity || 'N/A'}</p>
+                        <p><strong>Calorie Burn:</strong> ${activity.calorie_burn || 'N/A'}</p>
+                        <div style="background:#f8d7da;padding:10px;border-radius:6px;margin-top:10px;">
+                            <strong>⚠️ Clinical Alert:</strong> ${activity.clinical_alert || 'No alert'}
+                        </div>
+                        <p style="font-size:0.9em;color:#666;margin-top:10px;"><em>${activity.evidence || 'No evidence'}</em></p>
+                    </div>
+                </div>
+            `;
+            document.getElementById('activityContent').innerHTML = activityHtml;
+        }
+        
+        // Initialize
+        initSliders();
+    </script>
+</body>
+</html>
+"""
 
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    """Serve the frontend UI"""
+    return HTML_TEMPLATE
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
 
 # ============================================================
 # MAIN (for local development)
 # ============================================================
 if __name__ == "__main__":
-    # Test the engine locally
     print("=" * 60)
-    print("TESTING CDSS ENGINE")
+    print("🚀 GlucoseGuard CDSS - Starting Server")
     print("=" * 60)
-    
-    cgm_readings = [140, 145, 150, 155, 160, 165, 170, 175, 180, 185]
-    
-    engine = get_engine()
-    result = engine.run(cgm_readings)
-    
-    print(f"Risk Level: {result['risk']['risk_level']}")
-    print(f"Dominant Risk: {result['risk']['dominant_risk']}")
-    print(f"Clinical Summary: {result['risk']['clinical_summary']}")
-    
-    print("\n" + "=" * 60)
-    print("STARTING FASTAPI SERVER")
+    print("📊 API Endpoint: http://localhost:8000/api/predict")
+    print("🌐 Frontend UI: http://localhost:8000")
     print("=" * 60)
-    print("Visit http://localhost:8000/docs for API documentation")
     uvicorn.run(app, host="0.0.0.0", port=8000)
