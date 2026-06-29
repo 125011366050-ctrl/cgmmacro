@@ -1,24 +1,39 @@
+# ============================================================
+# VERCEL-OPTIMIZED engine.py - Complete Single File
+# All models in project root (no separate folders)
+# Deploy directly to Vercel as a Serverless Function
+# ============================================================
+
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
-import joblib
 import os
 import warnings
+import json
 from datetime import datetime
-from typing import Dict, Tuple, List
+from typing import Dict, Tuple, List, Optional
 from dataclasses import dataclass
-from pytorch_tabnet.tab_model import TabNetRegressor
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import uvicorn
 
 warnings.filterwarnings('ignore')
 
+# ============================================================
+# CONFIGURATION - All files in project root
+# ============================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 @dataclass
 class Config:
     DATA_PATH: str = BASE_DIR
-    FOOD_FILE: str = os.path.join(BASE_DIR, "Indian_Foods_GI_GL_Database (1).xlsx")
-    DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
+    # All model files in project root (no subfolders)
+    FEATURE_SCALER_FILE: str = os.path.join(BASE_DIR, "feature_scaler.pkl")
+    GLUCOSE_SCALER_FILE: str = os.path.join(BASE_DIR, "glucose_scaler.pkl")
+    LSTM_MODEL_FILE: str = os.path.join(BASE_DIR, "lstm_encoder_trained.pth")
+    TABNET_MODEL_FILE: str = os.path.join(BASE_DIR, "tabnet_on_learned_embeddings.zip")
+    EMBEDDING_SCALER_FILE: str = os.path.join(BASE_DIR, "embedding_scaler.pkl")
+    FOOD_DB_FILE: str = os.path.join(BASE_DIR, "Indian_Foods_GI_GL_Database.xlsx")
+    DEVICE: str = "cpu"
     SEED: int = 42
     HIDDEN_SIZE: int = 128
     N_HORIZONS: int = 3
@@ -50,60 +65,9 @@ class Config:
     RAPID_RISE_THRESHOLD: float = 40.0
 
 
-# ─────────────────────────────────────────────────────────────
-#  REMOTE MODEL DOWNLOAD (Google Drive fallback)
-# ─────────────────────────────────────────────────────────────
-REMOTE_FILES = {
-    "feature_scaler.pkl":                  "PUT_FEATURE_SCALER_FILE_ID_HERE",
-    "glucose_scaler.pkl":                  "PUT_GLUCOSE_SCALER_FILE_ID_HERE",
-    "lstm_encoder_trained.pth":            "PUT_LSTM_FILE_ID_HERE",
-    "tabnet_on_learned_embeddings.zip":    "PUT_TABNET_FILE_ID_HERE",
-    "embedding_scaler.pkl":                "PUT_EMBEDDING_SCALER_FILE_ID_HERE",
-    "Indian_Foods_GI_GL_Database (1).xlsx": "PUT_FOOD_DB_FILE_ID_HERE",
-}
-
-
-def ensure_file(filename: str, base_dir: str, required: bool = True) -> str:
-    local_path = os.path.join(base_dir, filename)
-    if os.path.exists(local_path):
-        return local_path
-    
-    file_id = REMOTE_FILES.get(filename, "")
-    placeholder = file_id.startswith("PUT_") or not file_id
-    
-    if placeholder:
-        if required:
-            raise FileNotFoundError(
-                f"Missing file: {local_path}\n"
-                f"It is not in the repo AND no valid Google Drive ID is set "
-                f"in REMOTE_FILES['{filename}']. Either commit the file to "
-                f"the repo, or put a real Drive file ID in REMOTE_FILES."
-            )
-        else:
-            print(f"⚠️ Optional file '{filename}' not found and not configured — skipping.")
-            return local_path
-    
-    try:
-        import gdown
-    except ImportError:
-        raise ImportError(
-            "gdown is not installed. Add 'gdown' to requirements.txt to enable "
-            "automatic model downloads."
-        )
-    
-    print(f"⬇️ Downloading '{filename}' from Google Drive (id={file_id})...")
-    url = f"https://drive.google.com/uc?id={file_id}"
-    gdown.download(url, local_path, quiet=False)
-    
-    if not os.path.exists(local_path):
-        raise FileNotFoundError(
-            f"Download of '{filename}' failed — file still missing at {local_path}. "
-            f"Check that the Drive file ID is correct and shared as 'Anyone with link'."
-        )
-    print(f"✓ Downloaded '{filename}'")
-    return local_path
-
-
+# ============================================================
+# UTILITY FUNCTIONS
+# ============================================================
 def build_cgm_features(g: np.ndarray, carbs=0, protein=0, fat=0) -> np.ndarray:
     g = np.array(g, dtype=np.float32)
     if len(g) < 3:
@@ -153,53 +117,7 @@ def build_lstm_input(cgm_readings, carbs=0, protein=0, fat=0, window_size=36) ->
     return seq
 
 
-class LSTMEncoder(nn.Module):
-    def __init__(self, input_size, hidden_size=128, n_horizons=3):
-        super().__init__()
-        self.lstm = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=2,
-            batch_first=True,
-            dropout=0.2
-        )
-        self.embedding = nn.Sequential(
-            nn.Linear(hidden_size, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, 64),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Dropout(0.2)
-        )
-        self.output = nn.Linear(64, n_horizons)
-
-    def forward(self, x):
-        _, (h, _) = self.lstm(x)
-        return self.output(self.embedding(h[-1]))
-
-    def get_embedding(self, x):
-        _, (h, _) = self.lstm(x)
-        return self.embedding(h[-1])
-
-
-def _probe_scaler(scaler, n_horizons=3):
-    try:
-        scaler.inverse_transform(np.zeros((1, n_horizons)))
-        return 'multi'
-    except Exception:
-        pass
-    try:
-        scaler.inverse_transform(np.zeros((1, 1)))
-        return 'single'
-    except Exception:
-        pass
-    return 'none'
-
-
 def safe_risk(risk: dict) -> dict:
-    """Crash-proof accessor — works with both old and new key names."""
     return {
         "risk_level":       risk.get("risk_level", "LOW"),
         "spike":            risk.get("upward_spike", risk.get("spike", 0.0)),
@@ -257,378 +175,6 @@ def compute_true_trough(current: float, pred: np.ndarray) -> float:
     return float(np.min(all_points))
 
 
-class PredictionEngine:
-    def __init__(self, config: Config):
-        self.config = config
-        self.device = torch.device(config.DEVICE)
-        self.rng = np.random.default_rng(seed=config.SEED)
-        self.load_models()
-
-    def load_models(self):
-        base = self.config.DATA_PATH
-
-        feature_scaler_path = ensure_file("feature_scaler.pkl", base, required=True)
-        self.feature_scaler = joblib.load(feature_scaler_path)
-        print("✓ Feature scaler loaded")
-
-        scaler_path = ensure_file("glucose_scaler.pkl", base, required=True)
-        self.scaler = joblib.load(scaler_path)
-        self.scaler_mode = _probe_scaler(self.scaler, self.config.N_HORIZONS)
-        print(f"✓ Glucose scaler loaded — mode: {self.scaler_mode}")
-
-        self.lstm = LSTMEncoder(
-            input_size=self.config.INPUT_SIZE,
-            hidden_size=self.config.HIDDEN_SIZE,
-            n_horizons=self.config.N_HORIZONS
-        ).to(self.device)
-
-        lstm_path = ensure_file("lstm_encoder_trained.pth", base, required=True)
-        self.lstm.load_state_dict(
-            torch.load(lstm_path, map_location=self.device),
-            strict=False
-        )
-        self.lstm.eval()
-        for param in self.lstm.parameters():
-            param.requires_grad = False
-        print("✓ LSTM loaded and frozen")
-
-        tabnet_path = ensure_file("tabnet_on_learned_embeddings.zip", base, required=True)
-        self.tabnet = TabNetRegressor()
-        self.tabnet.load_model(tabnet_path)
-        print("✓ TabNet loaded")
-
-        embedding_scaler_path = ensure_file("embedding_scaler.pkl", base, required=False)
-        if os.path.exists(embedding_scaler_path):
-            self.embedding_scaler = joblib.load(embedding_scaler_path)
-            print("✓ Embedding scaler loaded")
-        else:
-            self.embedding_scaler = None
-            print("⚠️ No embedding scaler — using z-norm fallback")
-
-    def _scale_features(self, x: np.ndarray) -> np.ndarray:
-        original_shape = x.shape
-        x_flat = x.reshape(-1, x.shape[-1])
-        x_scaled = self.feature_scaler.transform(x_flat)
-        x_scaled = np.nan_to_num(x_scaled, nan=0.0, posinf=0.0, neginf=0.0)
-        return x_scaled.reshape(original_shape)
-
-    def _inverse_scale(self, raw: np.ndarray) -> np.ndarray:
-        raw = np.array(raw, dtype=np.float32).reshape(-1)
-        try:
-            if self.scaler_mode == 'multi':
-                result = self.scaler.inverse_transform(raw.reshape(1, -1)).flatten()
-            elif self.scaler_mode == 'single':
-                result = np.array([
-                    self.scaler.inverse_transform([[v]])[0][0] for v in raw
-                ])
-            else:
-                result = raw.copy()
-            result = np.nan_to_num(result, nan=120.0, posinf=400.0, neginf=40.0)
-            return result
-        except Exception as e:
-            print(f"⚠️ inverse_scale failed: {e} — returning raw")
-            return raw.copy()
-
-    def predict_glucose(self, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        if len(x.shape) == 2:
-            x = x[np.newaxis, :, :]
-        x = x.astype(np.float32)
-        current_glucose = float(x[0, -1, 0])
-
-        x_scaled = self._scale_features(x)
-        t = torch.from_numpy(x_scaled).float().to(self.device)
-        with torch.no_grad():
-            emb = self.lstm.get_embedding(t).cpu().numpy().astype(np.float32)
-            emb = emb.reshape(emb.shape[0], -1)
-
-            if self.embedding_scaler is not None:
-                emb = self.embedding_scaler.transform(emb)
-            else:
-                emb_mean = np.mean(emb, axis=1, keepdims=True)
-                emb_std = np.std(emb, axis=1, keepdims=True)
-                emb = (emb - emb_mean) / (emb_std + 1e-6)
-            emb = np.clip(emb, -5, 5)
-            emb = np.nan_to_num(emb, nan=0.0, posinf=0.0, neginf=0.0)
-
-            raw = self.tabnet.predict(emb)
-            raw = np.array(raw, dtype=np.float32).flatten()
-
-            pred = self._inverse_scale(raw)
-            pred = np.clip(pred, 40, 400)
-
-            if len(pred) == 1:
-                base_val = float(pred[0])
-                pred = np.array([base_val, base_val * 1.01, base_val * 1.02], dtype=np.float32)
-
-            pred = soft_physiology_adjust(pred, current_glucose, self.config.SOFT_MAX_STEP)
-            pred = np.clip(pred, 40, 400)
-
-            mean_pred, lower, upper = add_uncertainty(pred, self.config.UNCERTAINTY_STD)
-
-            return mean_pred, lower, upper
-
-    def _classify_drop(self, drop: float) -> str:
-        if drop >= self.config.DROP_HIGH_ALERT:
-            return "HIGH_ALERT"
-        elif drop >= self.config.DROP_MODERATE_ALERT:
-            return "MODERATE_ALERT"
-        elif drop >= self.config.DROP_CAUTION:
-            return "CAUTION"
-        else:
-            return "NORMAL"
-
-    def _compute_glucose_velocity(self, current: float, pred: np.ndarray) -> float:
-        # ========== FIX: Correct velocity calculation ==========
-        return float((pred[0] - current) / 30.0)
-
-    def _classify_velocity(self, velocity: float) -> str:
-        abs_v = abs(velocity)
-        if abs_v >= self.config.VELOCITY_HIGH_RISK:
-            return "RAPID_FALL" if velocity < 0 else "RAPID_RISE"
-        elif abs_v >= self.config.VELOCITY_MEDIUM_RISK:
-            return "MODERATE_FALL" if velocity < 0 else "MODERATE_RISE"
-        return "STABLE"
-
-    def _compute_risk_score(self, current: float, upward_spike: float,
-                            downward_drop: float, trough: float,
-                            velocity: float) -> float:
-        hyper_score    = min(1.0, max(0.0, (current - 140) / 100.0))
-        spike_score    = min(1.0, upward_spike / 80.0)
-        drop_score     = min(1.0, downward_drop / 80.0)
-        trough_score   = min(1.0, max(0.0, (90 - trough) / 50.0))
-        velocity_score = min(1.0, abs(velocity) / self.config.VELOCITY_HIGH_RISK)
-        score = (
-            0.20 * hyper_score +
-            0.20 * spike_score +
-            0.25 * drop_score +
-            0.20 * trough_score +
-            0.15 * velocity_score
-        )
-        return round(float(np.clip(score, 0.0, 1.0)), 3)
-
-    def _build_clinical_summary(self, risk_level: str, dominant_risk: str,
-                                current: float, trough: float,
-                                upward_spike: float, downward_drop: float,
-                                velocity: float, hypo_risk: bool,
-                                hypo_warning: bool, trend_strength: float) -> str:
-        direction = "falling" if velocity < 0 else "rising"
-        rate = abs(round(velocity, 2))
-        
-        if dominant_risk == "HYPOGLYCEMIA":
-            return (f"HYPOGLYCEMIA ALERT: Glucose {current:.0f} mg/dL falling at "
-                    f"{rate} mg/dL/min. Predicted trough {trough:.0f} mg/dL — "
-                    f"below safe threshold. Immediate action required.")
-        elif dominant_risk == "DROP_RISK":
-            return (f"FALL RISK: Glucose {current:.0f} mg/dL {direction} at "
-                    f"{rate} mg/dL/min. Predicted drop of {downward_drop:.0f} mg/dL "
-                    f"to {trough:.0f} mg/dL over 2 hours.")
-        elif dominant_risk == "HYPERGLYCEMIA":
-            if trend_strength > 1.5:
-                return (f"HIGH GLUCOSE RISING: Current {current:.0f} mg/dL with rapid "
-                        f"rise at {rate} mg/dL/min (trend strength {trend_strength:.1f}). "
-                        f"Predicted spike of {upward_spike:.0f} mg/dL. "
-                        f"Immediate glucose control intervention needed.")
-            else:
-                return (f"HIGH GLUCOSE: Current {current:.0f} mg/dL with predicted spike "
-                        f"of {upward_spike:.0f} mg/dL. Glucose control intervention needed.")
-        elif dominant_risk == "HYPO_WARNING":
-            return (f"EARLY WARNING: Glucose {current:.0f} mg/dL trending {direction}. "
-                    f"Predicted to reach {trough:.0f} mg/dL — approaching caution zone.")
-        else:
-            return (f"Glucose {current:.0f} mg/dL — {direction} at {rate} mg/dL/min. "
-                    f"Within acceptable range. Continue monitoring.")
-
-    def compute_risk(self, current: float,
-                     predictions: np.ndarray,
-                     lower: np.ndarray,
-                     upper: np.ndarray) -> Dict:
-        peak   = compute_true_peak(current, predictions)
-        trough = compute_true_trough(current, predictions)
-
-        worst_trough = compute_true_trough(current, lower)
-        worst_peak   = compute_true_peak(current, upper)
-
-        upward_spike  = max(0.0, worst_peak - current)
-        downward_drop = max(0.0, current - worst_trough)
-
-        drop_severity  = self._classify_drop(downward_drop)
-        trend          = float(predictions[0] - current)
-        trend_direction = "FALLING" if trend < -5 else "RISING" if trend > 5 else "STABLE"
-
-        velocity      = self._compute_glucose_velocity(current, predictions)
-        velocity_risk = self._classify_velocity(velocity)
-
-        # ========== FIX 1: Add trend_strength ==========
-        trend_strength = float(np.polyfit(range(len(predictions)), predictions, 1)[0])
-
-        # ========== FIX 3: COMPUTE CGM-DERIVED VELOCITY ==========
-        # This gives us the true trend from the data
-        cgm_velocity = 0.0
-        # Use the original CGM data to compute true trend
-        # Note: We don't have access to original CGM here, so we'll use predictions trend
-        # But we can infer from predictions
-
-        # Hypo detection
-        hypo_risk = np.mean(predictions < self.config.HYPO_THRESHOLD) >= 0.6
-        hypo_warning = np.mean(predictions < self.config.HYPO_WARNING) >= 0.5
-
-        # ========== FIX 4: Trend-sensitive hyperglycemia ==========
-        hyper_risk = (
-            # Threshold-based
-            (current >= self.config.WARNING_GLUCOSE and np.max(predictions) >= self.config.WARNING_GLUCOSE) or
-            # Trend-based - pattern aware
-            (trend_strength > 1.5 and current >= 150) or
-            # Mean-based
-            (np.mean(predictions >= self.config.WARNING_GLUCOSE) >= 0.5)
-        )
-        
-        # If strongly rising, definitely flag hyperglycemia
-        if trend_strength > 2.0 and current >= 140:
-            hyper_risk = True
-
-        # Velocity noise reduction
-        velocity_high = abs(velocity) >= self.config.VELOCITY_HIGH_RISK and \
-                        abs(predictions[0] - current) >= 20
-
-        drop_risk_high   = downward_drop >= self.config.CRITICAL_DROP
-        drop_risk_medium = downward_drop >= self.config.MODERATE_DROP
-        spike_risk_high  = upward_spike >= self.config.MEDIUM_SPIKE
-        spike_risk_medium = upward_spike >= self.config.LOW_SPIKE
-
-        # ========== SCORE-BASED RISK SELECTION ==========
-        hypo_score = int(hypo_risk) * 3 + int(hypo_warning) * 2
-        drop_score = int(drop_risk_high) * 3 + int(drop_risk_medium) * 2
-        hyper_score = int(hyper_risk) * 3 + int(spike_risk_high) * 2 + int(spike_risk_medium) * 1
-        velocity_score = int(velocity_high) * 2
-        
-        # Add trend strength bonus for hyperglycemia
-        if trend_strength > 1.0:
-            hyper_score += 1
-        if trend_strength > 1.5:
-            hyper_score += 1
-        if trend_strength > 2.0:
-            hyper_score += 1
-        
-        # ========== FIX 5: CLINICAL RULE OVERRIDE ==========
-        # If current glucose is high AND trend is rising, force HYPERGLYCEMIA
-        if current >= self.config.HYPERGLYCEMIA_THRESHOLD and trend_strength > 0.5:
-            hyper_score = max(hyper_score, 10)  # Force high score
-            # Ensure trend direction is correctly set
-            trend_direction = "RISING"
-        
-        # If current is high, DROP_RISK should never be dominant
-        if current >= self.config.HYPERGLYCEMIA_THRESHOLD:
-            drop_score = 0  # Zero out drop risk when hyperglycemic
-        
-        risk_scores = {
-            "HYPOGLYCEMIA": hypo_score,
-            "DROP_RISK": drop_score,
-            "HYPERGLYCEMIA": hyper_score,
-            "VELOCITY_RISK": velocity_score
-        }
-        
-        # Determine risk level
-        if max(risk_scores.values()) >= 3:
-            risk_level = "HIGH"
-        elif max(risk_scores.values()) >= 2:
-            risk_level = "MEDIUM"
-        else:
-            risk_level = "LOW"
-
-        # ========== DOMINANT RISK SELECTION WITH CLINICAL OVERRIDE ==========
-        def is_consistently_rising(arr, window=3):
-            if len(arr) < window:
-                return False
-            diffs = np.diff(arr[:window])
-            return np.all(diffs > -2)
-
-        def is_consistently_falling(arr, window=3):
-            if len(arr) < window:
-                return False
-            diffs = np.diff(arr[:window])
-            return np.all(diffs < 2)
-
-        max_score = max(risk_scores.values())
-        top_risks = [r for r, s in risk_scores.items() if s == max_score]
-        
-        # ========== FIX 6: CLINICAL OVERRIDE FOR DOMINANT RISK ==========
-        # If hyperglycemic, DOMINANT MUST be HYPERGLYCEMIA
-        if current >= self.config.HYPERGLYCEMIA_THRESHOLD:
-            dominant_risk = "HYPERGLYCEMIA"
-            # Force trend direction
-            trend_direction = "RISING"
-            # Ensure velocity is positive
-            if velocity < 0:
-                velocity = abs(velocity)
-        elif max_score >= 3:
-            if "HYPOGLYCEMIA" in top_risks and is_consistently_falling(predictions):
-                dominant_risk = "HYPOGLYCEMIA"
-            elif "HYPERGLYCEMIA" in top_risks and (is_consistently_rising(predictions) or trend_strength > 1.0):
-                dominant_risk = "HYPERGLYCEMIA"
-            elif "DROP_RISK" in top_risks:
-                dominant_risk = "DROP_RISK"
-            else:
-                dominant_risk = top_risks[0]
-        elif max_score >= 2:
-            if "HYPERGLYCEMIA" in top_risks:
-                dominant_risk = "HYPERGLYCEMIA"
-            elif "HYPOGLYCEMIA" in top_risks:
-                dominant_risk = "HYPOGLYCEMIA"
-            elif "DROP_RISK" in top_risks:
-                dominant_risk = "DROP_RISK"
-            else:
-                dominant_risk = top_risks[0]
-        else:
-            dominant_risk = "NONE"
-
-        # ========== FIX 7: FINAL SAFETY CHECK ==========
-        # If glucose > 180, ensure no DROP_RISK appears
-        if current >= self.config.HYPERGLYCEMIA_THRESHOLD:
-            if "DROP" in dominant_risk:
-                dominant_risk = "HYPERGLYCEMIA"
-            risk_level = "HIGH"
-
-        risk_score = self._compute_risk_score(
-            current, upward_spike, downward_drop, trough, velocity
-        )
-        clinical_summary = self._build_clinical_summary(
-            risk_level, dominant_risk, current, trough,
-            upward_spike, downward_drop, velocity, hypo_risk, 
-            hypo_warning, trend_strength
-        )
-
-        return {
-            "risk_level":       risk_level,
-            "risk_score":       risk_score,
-            "dominant_risk":    dominant_risk,
-            "clinical_summary": clinical_summary,
-            "current":          float(current),
-            "peak":             peak,
-            "trough":           trough,
-            "worst_peak":       worst_peak,
-            "worst_trough":     worst_trough,
-            "upward_spike":     upward_spike,
-            "spike":            upward_spike,
-            "downward_drop":    downward_drop,
-            "drop":             downward_drop,
-            "drop_severity":    drop_severity,
-            "trend":            trend,
-            "trend_direction":  trend_direction,
-            "trend_strength":   float(trend_strength),
-            "glucose_velocity": round(velocity, 3),
-            "velocity_risk":    velocity_risk,
-            "hypo_risk":        hypo_risk,
-            "hypo_warning":     hypo_warning,
-            "predictions":      predictions.tolist(),
-            "uncertainty": {
-                "lower": lower.tolist(),
-                "upper": upper.tolist(),
-                "std":   list(self.config.UNCERTAINTY_STD),
-            },
-            "requires_action": risk_level in ["MEDIUM", "HIGH"],
-        }
-
-
 def load_food_database(food_file: str) -> pd.DataFrame:
     for sheet in ["GI & Nutrition Data", "Sheet1", 0]:
         try:
@@ -672,10 +218,12 @@ def load_food_database(food_file: str) -> pd.DataFrame:
     df["GI"] = df["GI"].replace(0, np.nan)
     median_gi = df["GI"].median()
     df["GI"] = df["GI"].fillna(median_gi)
-    print(f"✓ Food DB ready | GI range: {df['GI'].min():.0f}–{df['GI'].max():.0f} | median GI: {median_gi:.0f}")
     return df
 
 
+# ============================================================
+# FOOD RANKING ENGINE
+# ============================================================
 class FoodRankingEngine:
     def __init__(self):
         pass
@@ -756,16 +304,12 @@ class FoodRankingEngine:
             avg_pred = np.mean(predictions)
             if avg_pred > 180:
                 out["Reason"] = "Predicted high glucose - low GI recommended"
+                out["Target_Score"] = 1.0 - (out["Predicted_Spike"] / 80.0)
             elif avg_pred < 100:
                 out["Reason"] = "Predicted low glucose - higher GI acceptable"
-            else:
-                out["Reason"] = "Balanced glucose - maintain healthy choices"
-            
-            if np.mean(predictions) > 180:
-                out["Target_Score"] = 1.0 - (out["Predicted_Spike"] / 80.0)
-            elif np.mean(predictions) < 100:
                 out["Target_Score"] = out["Predicted_Spike"] / 80.0
             else:
+                out["Reason"] = "Balanced glucose - maintain healthy choices"
                 out["Target_Score"] = 0.5
         else:
             out["Target_Score"] = 0.5
@@ -852,6 +396,9 @@ class FoodRankingEngine:
         return plan
 
 
+# ============================================================
+# ACTIVITY ENGINE
+# ============================================================
 class ActivityEngine:
     def __init__(self):
         pass
@@ -955,16 +502,480 @@ class ActivityEngine:
         }
 
 
-class ClinicalOrchestrator:
-    def __init__(self, config: Config):
+# ============================================================
+# VERCEL-OPTIMIZED PREDICTION ENGINE
+# ============================================================
+class PredictionEngine:
+    """Lazy-loaded prediction engine optimized for serverless environments"""
+    
+    _instance = None
+    _initialized = False
+    
+    def __new__(cls, config: Config = None):
+        if cls._instance is None:
+            cls._instance = super(PredictionEngine, cls).__new__(cls)
+        return cls._instance
+    
+    def __init__(self, config: Config = None):
+        if self._initialized:
+            return
+        
+        if config is None:
+            config = Config()
+        
         self.config = config
-        self.prediction_engine = PredictionEngine(config)
-        food_path = ensure_file(
-            "Indian_Foods_GI_GL_Database (1).xlsx", config.DATA_PATH, required=True
+        self.device = "cpu"
+        self.rng = np.random.default_rng(seed=config.SEED)
+        
+        # Lazy-loaded attributes
+        self._feature_scaler = None
+        self._glucose_scaler = None
+        self._scaler_mode = None
+        self._lstm = None
+        self._tabnet = None
+        self._embedding_scaler = None
+        self._models_loaded = False
+        
+        self._initialized = True
+        print("✓ PredictionEngine initialized (models will load on first use)")
+
+    def _load_models(self):
+        """Lazy load models only when needed"""
+        if self._models_loaded:
+            return
+        
+        try:
+            # Lazy imports - only imported when needed
+            import torch
+            import joblib
+            import torch.nn as nn
+            from pytorch_tabnet.tab_model import TabNetRegressor
+        except ImportError as e:
+            raise ImportError(f"Required ML packages not installed: {e}")
+        
+        # Load scalers from project root
+        if not os.path.exists(self.config.FEATURE_SCALER_FILE):
+            raise FileNotFoundError(f"Missing model file: {self.config.FEATURE_SCALER_FILE}")
+        self._feature_scaler = joblib.load(self.config.FEATURE_SCALER_FILE)
+        print("✓ Feature scaler loaded")
+        
+        if not os.path.exists(self.config.GLUCOSE_SCALER_FILE):
+            raise FileNotFoundError(f"Missing model file: {self.config.GLUCOSE_SCALER_FILE}")
+        self._glucose_scaler = joblib.load(self.config.GLUCOSE_SCALER_FILE)
+        self._scaler_mode = self._probe_scaler(self._glucose_scaler, self.config.N_HORIZONS)
+        print(f"✓ Glucose scaler loaded — mode: {self._scaler_mode}")
+        
+        # Define LSTM Encoder class
+        class LSTMEncoder(nn.Module):
+            def __init__(self, input_size, hidden_size=128, n_horizons=3):
+                super().__init__()
+                self.lstm = nn.LSTM(
+                    input_size=input_size,
+                    hidden_size=hidden_size,
+                    num_layers=2,
+                    batch_first=True,
+                    dropout=0.2
+                )
+                self.embedding = nn.Sequential(
+                    nn.Linear(hidden_size, 128),
+                    nn.BatchNorm1d(128),
+                    nn.ReLU(),
+                    nn.Dropout(0.2),
+                    nn.Linear(128, 64),
+                    nn.BatchNorm1d(64),
+                    nn.ReLU(),
+                    nn.Dropout(0.2)
+                )
+                self.output = nn.Linear(64, n_horizons)
+
+            def forward(self, x):
+                _, (h, _) = self.lstm(x)
+                return self.output(self.embedding(h[-1]))
+
+            def get_embedding(self, x):
+                _, (h, _) = self.lstm(x)
+                return self.embedding(h[-1])
+        
+        # Load LSTM
+        if not os.path.exists(self.config.LSTM_MODEL_FILE):
+            raise FileNotFoundError(f"Missing model file: {self.config.LSTM_MODEL_FILE}")
+        
+        self._lstm = LSTMEncoder(
+            input_size=self.config.INPUT_SIZE,
+            hidden_size=self.config.HIDDEN_SIZE,
+            n_horizons=self.config.N_HORIZONS
         )
-        self.food_df = load_food_database(food_path)
+        self._lstm.load_state_dict(
+            torch.load(self.config.LSTM_MODEL_FILE, map_location="cpu"),
+            strict=False
+        )
+        self._lstm.eval()
+        for param in self._lstm.parameters():
+            param.requires_grad = False
+        print("✓ LSTM loaded and frozen")
+        
+        # Load TabNet
+        if not os.path.exists(self.config.TABNET_MODEL_FILE):
+            raise FileNotFoundError(f"Missing model file: {self.config.TABNET_MODEL_FILE}")
+        self._tabnet = TabNetRegressor()
+        self._tabnet.load_model(self.config.TABNET_MODEL_FILE)
+        print("✓ TabNet loaded")
+        
+        # Load embedding scaler (optional)
+        if os.path.exists(self.config.EMBEDDING_SCALER_FILE):
+            self._embedding_scaler = joblib.load(self.config.EMBEDDING_SCALER_FILE)
+            print("✓ Embedding scaler loaded")
+        else:
+            self._embedding_scaler = None
+            print("⚠️ No embedding scaler — using z-norm fallback")
+        
+        self._models_loaded = True
+        print("✓ All models loaded successfully")
+
+    def _probe_scaler(self, scaler, n_horizons=3):
+        try:
+            scaler.inverse_transform(np.zeros((1, n_horizons)))
+            return 'multi'
+        except Exception:
+            pass
+        try:
+            scaler.inverse_transform(np.zeros((1, 1)))
+            return 'single'
+        except Exception:
+            pass
+        return 'none'
+
+    def _scale_features(self, x: np.ndarray) -> np.ndarray:
+        original_shape = x.shape
+        x_flat = x.reshape(-1, x.shape[-1])
+        x_scaled = self._feature_scaler.transform(x_flat)
+        x_scaled = np.nan_to_num(x_scaled, nan=0.0, posinf=0.0, neginf=0.0)
+        return x_scaled.reshape(original_shape)
+
+    def _inverse_scale(self, raw: np.ndarray) -> np.ndarray:
+        raw = np.array(raw, dtype=np.float32).reshape(-1)
+        try:
+            if self._scaler_mode == 'multi':
+                result = self._glucose_scaler.inverse_transform(raw.reshape(1, -1)).flatten()
+            elif self._scaler_mode == 'single':
+                result = np.array([
+                    self._glucose_scaler.inverse_transform([[v]])[0][0] for v in raw
+                ])
+            else:
+                result = raw.copy()
+            result = np.nan_to_num(result, nan=120.0, posinf=400.0, neginf=40.0)
+            return result
+        except Exception as e:
+            print(f"⚠️ inverse_scale failed: {e} — returning raw")
+            return raw.copy()
+
+    def predict_glucose(self, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        import torch  # Lazy import
+        self._load_models()  # Ensure models are loaded
+        
+        if len(x.shape) == 2:
+            x = x[np.newaxis, :, :]
+        x = x.astype(np.float32)
+        current_glucose = float(x[0, -1, 0])
+
+        x_scaled = self._scale_features(x)
+        t = torch.from_numpy(x_scaled).float()
+        with torch.no_grad():
+            emb = self._lstm.get_embedding(t).cpu().numpy().astype(np.float32)
+            emb = emb.reshape(emb.shape[0], -1)
+
+            if self._embedding_scaler is not None:
+                emb = self._embedding_scaler.transform(emb)
+            else:
+                emb_mean = np.mean(emb, axis=1, keepdims=True)
+                emb_std = np.std(emb, axis=1, keepdims=True)
+                emb = (emb - emb_mean) / (emb_std + 1e-6)
+            emb = np.clip(emb, -5, 5)
+            emb = np.nan_to_num(emb, nan=0.0, posinf=0.0, neginf=0.0)
+
+            raw = self._tabnet.predict(emb)
+            raw = np.array(raw, dtype=np.float32).flatten()
+
+            pred = self._inverse_scale(raw)
+            pred = np.clip(pred, 40, 400)
+
+            if len(pred) == 1:
+                base_val = float(pred[0])
+                pred = np.array([base_val, base_val * 1.01, base_val * 1.02], dtype=np.float32)
+
+            pred = soft_physiology_adjust(pred, current_glucose, self.config.SOFT_MAX_STEP)
+            pred = np.clip(pred, 40, 400)
+
+            mean_pred, lower, upper = add_uncertainty(pred, self.config.UNCERTAINTY_STD)
+
+            return mean_pred, lower, upper
+
+    def _classify_drop(self, drop: float) -> str:
+        if drop >= self.config.DROP_HIGH_ALERT:
+            return "HIGH_ALERT"
+        elif drop >= self.config.DROP_MODERATE_ALERT:
+            return "MODERATE_ALERT"
+        elif drop >= self.config.DROP_CAUTION:
+            return "CAUTION"
+        else:
+            return "NORMAL"
+
+    def _compute_glucose_velocity(self, current: float, pred: np.ndarray) -> float:
+        return float((pred[0] - current) / 30.0)
+
+    def _classify_velocity(self, velocity: float) -> str:
+        abs_v = abs(velocity)
+        if abs_v >= self.config.VELOCITY_HIGH_RISK:
+            return "RAPID_FALL" if velocity < 0 else "RAPID_RISE"
+        elif abs_v >= self.config.VELOCITY_MEDIUM_RISK:
+            return "MODERATE_FALL" if velocity < 0 else "MODERATE_RISE"
+        return "STABLE"
+
+    def _compute_risk_score(self, current: float, upward_spike: float,
+                            downward_drop: float, trough: float,
+                            velocity: float) -> float:
+        hyper_score    = min(1.0, max(0.0, (current - 140) / 100.0))
+        spike_score    = min(1.0, upward_spike / 80.0)
+        drop_score     = min(1.0, downward_drop / 80.0)
+        trough_score   = min(1.0, max(0.0, (90 - trough) / 50.0))
+        velocity_score = min(1.0, abs(velocity) / self.config.VELOCITY_HIGH_RISK)
+        score = (
+            0.20 * hyper_score +
+            0.20 * spike_score +
+            0.25 * drop_score +
+            0.20 * trough_score +
+            0.15 * velocity_score
+        )
+        return round(float(np.clip(score, 0.0, 1.0)), 3)
+
+    def _build_clinical_summary(self, risk_level: str, dominant_risk: str,
+                                current: float, trough: float,
+                                upward_spike: float, downward_drop: float,
+                                velocity: float, hypo_risk: bool,
+                                hypo_warning: bool, trend_strength: float) -> str:
+        direction = "falling" if velocity < 0 else "rising"
+        rate = abs(round(velocity, 2))
+        
+        if dominant_risk == "HYPOGLYCEMIA":
+            return (f"HYPOGLYCEMIA ALERT: Glucose {current:.0f} mg/dL falling at "
+                    f"{rate} mg/dL/min. Predicted trough {trough:.0f} mg/dL — "
+                    f"below safe threshold. Immediate action required.")
+        elif dominant_risk == "DROP_RISK":
+            return (f"FALL RISK: Glucose {current:.0f} mg/dL {direction} at "
+                    f"{rate} mg/dL/min. Predicted drop of {downward_drop:.0f} mg/dL "
+                    f"to {trough:.0f} mg/dL over 2 hours.")
+        elif dominant_risk == "HYPERGLYCEMIA":
+            if trend_strength > 1.5:
+                return (f"HIGH GLUCOSE RISING: Current {current:.0f} mg/dL with rapid "
+                        f"rise at {rate} mg/dL/min (trend strength {trend_strength:.1f}). "
+                        f"Predicted spike of {upward_spike:.0f} mg/dL. "
+                        f"Immediate glucose control intervention needed.")
+            else:
+                return (f"HIGH GLUCOSE: Current {current:.0f} mg/dL with predicted spike "
+                        f"of {upward_spike:.0f} mg/dL. Glucose control intervention needed.")
+        elif dominant_risk == "HYPO_WARNING":
+            return (f"EARLY WARNING: Glucose {current:.0f} mg/dL trending {direction}. "
+                    f"Predicted to reach {trough:.0f} mg/dL — approaching caution zone.")
+        else:
+            return (f"Glucose {current:.0f} mg/dL — {direction} at {rate} mg/dL/min. "
+                    f"Within acceptable range. Continue monitoring.")
+
+    def compute_risk(self, current: float,
+                     predictions: np.ndarray,
+                     lower: np.ndarray,
+                     upper: np.ndarray) -> Dict:
+        peak   = compute_true_peak(current, predictions)
+        trough = compute_true_trough(current, predictions)
+
+        worst_trough = compute_true_trough(current, lower)
+        worst_peak   = compute_true_peak(current, upper)
+
+        upward_spike  = max(0.0, worst_peak - current)
+        downward_drop = max(0.0, current - worst_trough)
+
+        drop_severity  = self._classify_drop(downward_drop)
+        trend          = float(predictions[0] - current)
+        trend_direction = "FALLING" if trend < -5 else "RISING" if trend > 5 else "STABLE"
+
+        velocity      = self._compute_glucose_velocity(current, predictions)
+        velocity_risk = self._classify_velocity(velocity)
+
+        trend_strength = float(np.polyfit(range(len(predictions)), predictions, 1)[0])
+
+        hypo_risk = np.mean(predictions < self.config.HYPO_THRESHOLD) >= 0.6
+        hypo_warning = np.mean(predictions < self.config.HYPO_WARNING) >= 0.5
+
+        hyper_risk = (
+            (current >= self.config.WARNING_GLUCOSE and np.max(predictions) >= self.config.WARNING_GLUCOSE) or
+            (trend_strength > 1.5 and current >= 150) or
+            (np.mean(predictions >= self.config.WARNING_GLUCOSE) >= 0.5)
+        )
+        
+        if trend_strength > 2.0 and current >= 140:
+            hyper_risk = True
+
+        velocity_high = abs(velocity) >= self.config.VELOCITY_HIGH_RISK and \
+                        abs(predictions[0] - current) >= 20
+
+        drop_risk_high   = downward_drop >= self.config.CRITICAL_DROP
+        drop_risk_medium = downward_drop >= self.config.MODERATE_DROP
+        spike_risk_high  = upward_spike >= self.config.MEDIUM_SPIKE
+        spike_risk_medium = upward_spike >= self.config.LOW_SPIKE
+
+        hypo_score = int(hypo_risk) * 3 + int(hypo_warning) * 2
+        drop_score = int(drop_risk_high) * 3 + int(drop_risk_medium) * 2
+        hyper_score = int(hyper_risk) * 3 + int(spike_risk_high) * 2 + int(spike_risk_medium) * 1
+        velocity_score = int(velocity_high) * 2
+        
+        if trend_strength > 1.0:
+            hyper_score += 1
+        if trend_strength > 1.5:
+            hyper_score += 1
+        if trend_strength > 2.0:
+            hyper_score += 1
+        
+        if current >= self.config.HYPERGLYCEMIA_THRESHOLD and trend_strength > 0.5:
+            hyper_score = max(hyper_score, 10)
+            trend_direction = "RISING"
+        
+        if current >= self.config.HYPERGLYCEMIA_THRESHOLD:
+            drop_score = 0
+        
+        risk_scores = {
+            "HYPOGLYCEMIA": hypo_score,
+            "DROP_RISK": drop_score,
+            "HYPERGLYCEMIA": hyper_score,
+            "VELOCITY_RISK": velocity_score
+        }
+        
+        if max(risk_scores.values()) >= 3:
+            risk_level = "HIGH"
+        elif max(risk_scores.values()) >= 2:
+            risk_level = "MEDIUM"
+        else:
+            risk_level = "LOW"
+
+        def is_consistently_rising(arr, window=3):
+            if len(arr) < window:
+                return False
+            diffs = np.diff(arr[:window])
+            return np.all(diffs > -2)
+
+        def is_consistently_falling(arr, window=3):
+            if len(arr) < window:
+                return False
+            diffs = np.diff(arr[:window])
+            return np.all(diffs < 2)
+
+        max_score = max(risk_scores.values())
+        top_risks = [r for r, s in risk_scores.items() if s == max_score]
+        
+        if current >= self.config.HYPERGLYCEMIA_THRESHOLD:
+            dominant_risk = "HYPERGLYCEMIA"
+            trend_direction = "RISING"
+            if velocity < 0:
+                velocity = abs(velocity)
+        elif max_score >= 3:
+            if "HYPOGLYCEMIA" in top_risks and is_consistently_falling(predictions):
+                dominant_risk = "HYPOGLYCEMIA"
+            elif "HYPERGLYCEMIA" in top_risks and (is_consistently_rising(predictions) or trend_strength > 1.0):
+                dominant_risk = "HYPERGLYCEMIA"
+            elif "DROP_RISK" in top_risks:
+                dominant_risk = "DROP_RISK"
+            else:
+                dominant_risk = top_risks[0]
+        elif max_score >= 2:
+            if "HYPERGLYCEMIA" in top_risks:
+                dominant_risk = "HYPERGLYCEMIA"
+            elif "HYPOGLYCEMIA" in top_risks:
+                dominant_risk = "HYPOGLYCEMIA"
+            elif "DROP_RISK" in top_risks:
+                dominant_risk = "DROP_RISK"
+            else:
+                dominant_risk = top_risks[0]
+        else:
+            dominant_risk = "NONE"
+
+        if current >= self.config.HYPERGLYCEMIA_THRESHOLD:
+            if "DROP" in dominant_risk:
+                dominant_risk = "HYPERGLYCEMIA"
+            risk_level = "HIGH"
+
+        risk_score = self._compute_risk_score(
+            current, upward_spike, downward_drop, trough, velocity
+        )
+        clinical_summary = self._build_clinical_summary(
+            risk_level, dominant_risk, current, trough,
+            upward_spike, downward_drop, velocity, hypo_risk, 
+            hypo_warning, trend_strength
+        )
+
+        return {
+            "risk_level":       risk_level,
+            "risk_score":       risk_score,
+            "dominant_risk":    dominant_risk,
+            "clinical_summary": clinical_summary,
+            "current":          float(current),
+            "peak":             peak,
+            "trough":           trough,
+            "worst_peak":       worst_peak,
+            "worst_trough":     worst_trough,
+            "upward_spike":     upward_spike,
+            "spike":            upward_spike,
+            "downward_drop":    downward_drop,
+            "drop":             downward_drop,
+            "drop_severity":    drop_severity,
+            "trend":            trend,
+            "trend_direction":  trend_direction,
+            "trend_strength":   float(trend_strength),
+            "glucose_velocity": round(velocity, 3),
+            "velocity_risk":    velocity_risk,
+            "hypo_risk":        hypo_risk,
+            "hypo_warning":     hypo_warning,
+            "predictions":      predictions.tolist(),
+            "uncertainty": {
+                "lower": lower.tolist(),
+                "upper": upper.tolist(),
+                "std":   list(self.config.UNCERTAINTY_STD),
+            },
+            "requires_action": risk_level in ["MEDIUM", "HIGH"],
+        }
+
+
+# ============================================================
+# CLINICAL ORCHESTRATOR
+# ============================================================
+class ClinicalOrchestrator:
+    """Main orchestrator with singleton pattern for Vercel"""
+    
+    _instance = None
+    _initialized = False
+    
+    def __new__(cls, config: Config = None):
+        if cls._instance is None:
+            cls._instance = super(ClinicalOrchestrator, cls).__new__(cls)
+        return cls._instance
+    
+    def __init__(self, config: Config = None):
+        if self._initialized:
+            return
+        
+        if config is None:
+            config = Config()
+        self.config = config
+        
+        # Lazy-load prediction engine (singleton)
+        self._prediction_engine = PredictionEngine(config)
+        
+        # Load food DB from project root
+        if not os.path.exists(config.FOOD_DB_FILE):
+            raise FileNotFoundError(f"Missing food database: {config.FOOD_DB_FILE}")
+        self.food_df = load_food_database(config.FOOD_DB_FILE)
+        
         self.ranking_engine = FoodRankingEngine()
         self.activity_engine = ActivityEngine()
+        
+        self._initialized = True
         print("✓ CDSS ready")
 
     def run(self, cgm_readings, carbs=0, protein=0, fat=0, top_k=10) -> Dict:
@@ -979,9 +990,9 @@ class ClinicalOrchestrator:
         )
         x = sequence[np.newaxis, :, :]
 
-        mean_pred, lower, upper = self.prediction_engine.predict_glucose(x)
+        mean_pred, lower, upper = self._prediction_engine.predict_glucose(x)
 
-        risk_info = self.prediction_engine.compute_risk(
+        risk_info = self._prediction_engine.compute_risk(
             current_glucose, mean_pred, lower, upper
         )
         risk_safe = safe_risk(risk_info)
@@ -1039,35 +1050,84 @@ class ClinicalOrchestrator:
                 "max_future": round(float(max(predictions_list)), 1),
                 "min_future": round(float(min(predictions_list)), 1),
             },
-            "food_recommendations": food_recs,
+            "food_recommendations": food_recs.to_dict("records") if not food_recs.empty else [],
             "meal_plan":            meal_plan,
             "activity":             activity,
         }
 
 
-# ========== SAFE TESTING CODE ==========
+# ============================================================
+# SINGLETON ACCESSOR
+# ============================================================
+_ENGINE = None
+
+def get_engine() -> ClinicalOrchestrator:
+    """Get the singleton engine instance (creates on first call)"""
+    global _ENGINE
+    if _ENGINE is None:
+        config = Config()
+        _ENGINE = ClinicalOrchestrator(config)
+    return _ENGINE
+
+
+# ============================================================
+# FASTAPI APP (Vercel entry point)
+# ============================================================
+app = FastAPI()
+
+class PredictionRequest(BaseModel):
+    cgm_readings: List[float]
+    carbs: Optional[float] = 0.0
+    protein: Optional[float] = 0.0
+    fat: Optional[float] = 0.0
+    top_k: Optional[int] = 10
+
+@app.post("/api/predict")
+async def predict(request: PredictionRequest):
+    """Main prediction endpoint for Vercel"""
+    try:
+        engine = get_engine()
+        result = engine.run(
+            cgm_readings=request.cgm_readings,
+            carbs=request.carbs,
+            protein=request.protein,
+            fat=request.fat,
+            top_k=request.top_k
+        )
+        return {"status": "success", "data": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/health")
+async def health():
+    return {"status": "healthy", "models_loaded": _ENGINE is not None}
+
+# For local testing
+@app.get("/")
+async def root():
+    return {"message": "CDSS API is running", "endpoints": ["/api/predict", "/api/health"]}
+
+
+# ============================================================
+# MAIN (for local development)
+# ============================================================
 if __name__ == "__main__":
-    # Test with rising pattern
+    # Test the engine locally
+    print("=" * 60)
+    print("TESTING CDSS ENGINE")
+    print("=" * 60)
+    
     cgm_readings = [140, 145, 150, 155, 160, 165, 170, 175, 180, 185]
     
-    config = Config()
-    orchestrator = ClinicalOrchestrator(config)
-    result = orchestrator.run(cgm_readings)
+    engine = get_engine()
+    result = engine.run(cgm_readings)
     
-    print("=" * 60)
-    print("RISK ANALYSIS")
-    print("=" * 60)
     print(f"Risk Level: {result['risk']['risk_level']}")
     print(f"Dominant Risk: {result['risk']['dominant_risk']}")
-    print(f"Risk Score: {result['risk']['risk_score']}")
-    print(f"Trend Strength: {result['risk']['trend_strength']:.2f}")
-    print(f"Trend Direction: {result['risk']['trend_direction']}")
-    print(f"Glucose Velocity: {result['risk']['glucose_velocity']:.2f}")
-    print(f"\nClinical Summary: {result['risk']['clinical_summary']}")
+    print(f"Clinical Summary: {result['risk']['clinical_summary']}")
     
     print("\n" + "=" * 60)
-    print("PREDICTIONS")
+    print("STARTING FASTAPI SERVER")
     print("=" * 60)
-    for horizon in ['30min', '60min', '120min']:
-        pred = result['predictions'][horizon]
-        print(f"{horizon}: {pred['mean']:.1f} mg/dL (range: {pred['lower']:.1f} - {pred['upper']:.1f})")
+    print("Visit http://localhost:8000/docs for API documentation")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
